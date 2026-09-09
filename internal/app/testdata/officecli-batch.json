@@ -1,0 +1,10 @@
+[
+  {
+    "command": "add",
+    "parent": "/body",
+    "type": "paragraph",
+    "props": {
+      "text": "Hello from chat2work-mcp"
+    }
+  }
+]

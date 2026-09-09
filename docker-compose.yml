@@ -1,0 +1,23 @@
+services:
+  chat2work-mcp:
+    build: .
+    image: chat2work-mcp:local
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/etc/chat2work/config.yaml:ro
+      - chat2work_workspace:/data/workspace
+      # Install a pinned OfficeCLI binary on the host and mount it read-only.
+      - ./bin/officecli:/opt/officecli/officecli:ro
+    environment:
+      OFFICECLI_PATH: /opt/officecli/officecli
+    networks:
+      - deeix-chat
+
+volumes:
+  chat2work_workspace:
+    name: chat2work-mcp-workspace
+
+networks:
+  deeix-chat:
+    external: true
+    name: deeix-chat-network

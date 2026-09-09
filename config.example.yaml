@@ -1,0 +1,10 @@
+listen_addr: ":8090"
+mcp_token: "replace-with-a-long-random-static-token"
+mcp_user_context_secret: "replace-with-the-same-value-as-deeix"
+workspace_root: "/data/workspace"
+max_file_bytes: 20971520
+officecli_path: "officecli"
+office_timeout: "60s"
+delete_enabled: false
+# Only used with `chat2work-mcp --stdio`; never enables anonymous HTTP calls.
+# stdio_tenant_id: "local-debug-user"
