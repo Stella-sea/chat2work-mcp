@@ -11,15 +11,35 @@ import (
 )
 
 type Config struct {
-	ListenAddr           string `yaml:"listen_addr"`
-	MCPToken             string `yaml:"mcp_token"`
-	MCPUserContextSecret string `yaml:"mcp_user_context_secret"`
-	WorkspaceRoot        string `yaml:"workspace_root"`
-	MaxFileBytes         int64  `yaml:"max_file_bytes"`
-	OfficeCLIPath        string `yaml:"officecli_path"`
-	OfficeTimeout        string `yaml:"office_timeout"`
-	DeleteEnabled        bool   `yaml:"delete_enabled"`
-	StdioTenantID        string `yaml:"stdio_tenant_id"`
+	ListenAddr           string            `yaml:"listen_addr"`
+	MCPToken             string            `yaml:"mcp_token"`
+	MCPUserContextSecret string            `yaml:"mcp_user_context_secret"`
+	WorkspaceRoot        string            `yaml:"workspace_root"`
+	MaxFileBytes         int64             `yaml:"max_file_bytes"`
+	MaxWorkspaceBytes    int64             `yaml:"max_workspace_bytes"`
+	MaxWorkspaceFiles    int               `yaml:"max_workspace_files"`
+	MaxListResults       int               `yaml:"max_list_results"`
+	MaxSearchResults     int               `yaml:"max_search_results"`
+	OfficeCLIPath        string            `yaml:"officecli_path"`
+	OfficeTimeout        string            `yaml:"office_timeout"`
+	DeleteEnabled        bool              `yaml:"delete_enabled"`
+	StdioTenantID        string            `yaml:"stdio_tenant_id"`
+	AuditLogPath         string            `yaml:"audit_log_path"`
+	DownloadBaseURL      string            `yaml:"download_base_url"`
+	DownloadTTL          string            `yaml:"download_ttl"`
+	DownloadSecret       string            `yaml:"download_secret"`
+	Workspaces           []WorkspaceConfig `yaml:"workspaces"`
+}
+
+type WorkspaceConfig struct {
+	ID      string            `yaml:"id"`
+	Name    string            `yaml:"name"`
+	Members []WorkspaceMember `yaml:"members"`
+}
+
+type WorkspaceMember struct {
+	UserID uint64 `yaml:"user_id"`
+	Access string `yaml:"access"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -41,6 +61,18 @@ func LoadConfig(path string) (Config, error) {
 	if c.MaxFileBytes <= 0 {
 		c.MaxFileBytes = 20 << 20
 	}
+	if c.MaxWorkspaceBytes <= 0 {
+		c.MaxWorkspaceBytes = 1 << 30
+	}
+	if c.MaxWorkspaceFiles <= 0 {
+		c.MaxWorkspaceFiles = 10000
+	}
+	if c.MaxListResults <= 0 {
+		c.MaxListResults = 1000
+	}
+	if c.MaxSearchResults <= 0 {
+		c.MaxSearchResults = 200
+	}
 	if c.OfficeCLIPath == "" {
 		c.OfficeCLIPath = "officecli"
 	}
@@ -50,16 +82,42 @@ func LoadConfig(path string) (Config, error) {
 	if _, err := time.ParseDuration(c.OfficeTimeout); err != nil {
 		return Config{}, fmt.Errorf("office_timeout: %w", err)
 	}
+	if c.DownloadTTL == "" {
+		c.DownloadTTL = "15m"
+	}
+	if _, err := time.ParseDuration(c.DownloadTTL); err != nil {
+		return Config{}, fmt.Errorf("download_ttl: %w", err)
+	}
+	if strings.TrimSpace(c.DownloadSecret) == "" {
+		c.DownloadSecret = c.MCPUserContextSecret
+	}
 	if strings.TrimSpace(c.MCPUserContextSecret) == "" {
 		return Config{}, fmt.Errorf("mcp_user_context_secret is required")
 	}
 	if strings.TrimSpace(c.MCPToken) == "" {
 		return Config{}, fmt.Errorf("mcp_token is required")
 	}
+	seen := map[string]struct{}{}
+	for _, workspace := range c.Workspaces {
+		if !validWorkspaceID(workspace.ID) {
+			return Config{}, fmt.Errorf("invalid workspace id %q", workspace.ID)
+		}
+		if _, ok := seen[workspace.ID]; ok {
+			return Config{}, fmt.Errorf("duplicate workspace id %q", workspace.ID)
+		}
+		seen[workspace.ID] = struct{}{}
+		for _, member := range workspace.Members {
+			if member.UserID == 0 || !validAccess(member.Access) {
+				return Config{}, fmt.Errorf("invalid member in workspace %q", workspace.ID)
+			}
+		}
+	}
 	return c, nil
 }
 
 func (c Config) OfficeDuration() time.Duration { d, _ := time.ParseDuration(c.OfficeTimeout); return d }
+
+func (c Config) DownloadDuration() time.Duration { d, _ := time.ParseDuration(c.DownloadTTL); return d }
 
 func applyEnv(c *Config) {
 	set := func(key string, target *string) {
@@ -74,6 +132,10 @@ func applyEnv(c *Config) {
 	set("OFFICECLI_PATH", &c.OfficeCLIPath)
 	set("OFFICE_TIMEOUT", &c.OfficeTimeout)
 	set("STDIO_TENANT_ID", &c.StdioTenantID)
+	set("AUDIT_LOG_PATH", &c.AuditLogPath)
+	set("DOWNLOAD_BASE_URL", &c.DownloadBaseURL)
+	set("DOWNLOAD_TTL", &c.DownloadTTL)
+	set("DOWNLOAD_SECRET", &c.DownloadSecret)
 	if v, ok := os.LookupEnv("MAX_FILE_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxFileBytes = n

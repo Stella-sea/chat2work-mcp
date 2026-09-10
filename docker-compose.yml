@@ -3,6 +3,10 @@ services:
     build: .
     image: chat2work-mcp:local
     restart: unless-stopped
+    # Localhost-only. Point your existing reverse proxy (the one already in
+    # front of DEEIX) at this port for signed download links. No DEEIX change.
+    ports:
+      - "127.0.0.1:8090:8090"
     volumes:
       - ./config.yaml:/etc/chat2work/config.yaml:ro
       - chat2work_workspace:/data/workspace

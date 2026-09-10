@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -17,11 +16,17 @@ const userContextHeader = "X-Deeix-User-Context"
 
 type userContext struct {
 	UserID    uint64 `json:"user_id"`
+	RequestID string `json:"request_id,omitempty"`
 	ExpiresAt int64  `json:"exp"`
 }
 
+type Identity struct {
+	UserID    uint64
+	RequestID string
+}
+
 type TenantResolver interface {
-	ResolveTenant(http.Header) (string, error)
+	ResolveIdentity(http.Header) (Identity, error)
 }
 
 type DeeixResolver struct {
@@ -29,27 +34,27 @@ type DeeixResolver struct {
 	Now    func() time.Time
 }
 
-func (r DeeixResolver) ResolveTenant(headers http.Header) (string, error) {
+func (r DeeixResolver) ResolveIdentity(headers http.Header) (Identity, error) {
 	token := strings.TrimSpace(headers.Get(userContextHeader))
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || parts[0] != "v1" || parts[1] == "" || parts[2] == "" {
-		return "", errors.New("missing or malformed signed user context")
+		return Identity{}, errors.New("missing or malformed signed user context")
 	}
 	mac := hmac.New(sha256.New, []byte(r.Secret))
 	_, _ = mac.Write([]byte(parts[1]))
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || !hmac.Equal(mac.Sum(nil), sig) {
-		return "", errors.New("invalid signed user context")
+		return Identity{}, errors.New("invalid signed user context")
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", errors.New("invalid signed user context")
+		return Identity{}, errors.New("invalid signed user context")
 	}
 	var payload userContext
 	if json.Unmarshal(raw, &payload) != nil || payload.UserID == 0 || payload.ExpiresAt <= r.now().Unix() {
-		return "", errors.New("expired or invalid signed user context")
+		return Identity{}, errors.New("expired or invalid signed user context")
 	}
-	return strconv.FormatUint(payload.UserID, 10), nil
+	return Identity{UserID: payload.UserID, RequestID: payload.RequestID}, nil
 }
 
 func (r DeeixResolver) now() time.Time {
@@ -69,10 +74,10 @@ func requireBearer(token string, next http.Handler) http.Handler {
 	})
 }
 
-func tenantFromRequest(resolver TenantResolver, headers http.Header) (string, error) {
-	tenant, err := resolver.ResolveTenant(headers)
+func identityFromRequest(resolver TenantResolver, headers http.Header) (Identity, error) {
+	identity, err := resolver.ResolveIdentity(headers)
 	if err != nil {
-		return "", fmt.Errorf("authorization failed: %w", err)
+		return Identity{}, fmt.Errorf("authorization failed: %w", err)
 	}
-	return tenant, nil
+	return identity, nil
 }

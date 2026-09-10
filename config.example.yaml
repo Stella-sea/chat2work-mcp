@@ -3,8 +3,31 @@ mcp_token: "replace-with-a-long-random-static-token"
 mcp_user_context_secret: "replace-with-the-same-value-as-deeix"
 workspace_root: "/data/workspace"
 max_file_bytes: 20971520
+max_workspace_bytes: 1073741824
+max_workspace_files: 10000
+max_list_results: 1000
+max_search_results: 200
 officecli_path: "officecli"
 office_timeout: "60s"
 delete_enabled: false
+audit_log_path: "/data/audit/chat2work.jsonl"
+# Time-limited download links returned by fs_link. The browser cannot send the
+# static MCP bearer token, so the link carries its own HMAC signature.
+# download_base_url is the externally reachable prefix (through your reverse
+# proxy). Leave empty to return a same-origin relative link.
+download_base_url: "https://your-domain.example/chat2work"
+download_ttl: "15m"
+# Defaults to mcp_user_context_secret when omitted.
+# download_secret: "replace-with-a-dedicated-random-secret"
+# Users not listed below receive only their private workspace, whose directory
+# is named after their signed DEEIX user_id. Add shared workspaces explicitly.
+# workspaces:
+#   - id: "finance"
+#     name: "Finance team"
+#     members:
+#       - user_id: 42
+#         access: "owner" # owner, editor, or viewer
+#       - user_id: 73
+#         access: "viewer"
 # Only used with `chat2work-mcp --stdio`; never enables anonymous HTTP calls.
 # stdio_tenant_id: "local-debug-user"

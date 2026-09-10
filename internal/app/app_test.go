@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,16 +43,16 @@ func TestDeeixResolver(t *testing.T) {
 	resolver := DeeixResolver{Secret: "secret", Now: func() time.Time { return now }}
 	headers := make(http.Header)
 	headers.Set(userContextHeader, signedContext(t, "secret", 42, 101))
-	tenant, err := resolver.ResolveTenant(headers)
-	if err != nil || tenant != "42" {
-		t.Fatalf("ResolveTenant() = %q, %v", tenant, err)
+	identity, err := resolver.ResolveIdentity(headers)
+	if err != nil || identity.UserID != 42 {
+		t.Fatalf("ResolveIdentity() = %+v, %v", identity, err)
 	}
 	headers.Set(userContextHeader, signedContext(t, "other", 42, 101))
-	if _, err := resolver.ResolveTenant(headers); err == nil {
+	if _, err := resolver.ResolveIdentity(headers); err == nil {
 		t.Fatal("accepted a forged signature")
 	}
 	headers.Set(userContextHeader, signedContext(t, "secret", 42, 100))
-	if _, err := resolver.ResolveTenant(headers); err == nil {
+	if _, err := resolver.ResolveIdentity(headers); err == nil {
 		t.Fatal("accepted an expired token")
 	}
 }
@@ -119,13 +122,77 @@ func TestFilesEditRequiresOneMatch(t *testing.T) {
 	}
 }
 
+func TestDownloadSignerRejectsTamperAndExpiry(t *testing.T) {
+	now := time.Unix(1000, 0)
+	signer := NewDownloadSigner("secret", "https://files.example.com", time.Minute)
+	signer.now = func() time.Time { return now }
+	link, expires, err := signer.URL("user-42", "reports/q1.docx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	if err := signer.verify("user-42", "reports/q1.docx", query.Get("exp"), query.Get("sig")); err != nil {
+		t.Fatalf("valid link rejected: %v", err)
+	}
+	if err := signer.verify("user-42", "reports/other.docx", query.Get("exp"), query.Get("sig")); err == nil {
+		t.Fatal("accepted a tampered path")
+	}
+	if !expires.After(now) {
+		t.Fatal("link should expire in the future")
+	}
+	expired := NewDownloadSigner("secret", "", time.Minute)
+	expired.now = func() time.Time { return now.Add(2 * time.Minute) }
+	if err := expired.verify("user-42", "reports/q1.docx", query.Get("exp"), query.Get("sig")); err == nil {
+		t.Fatal("accepted an expired link")
+	}
+	if err := NewDownloadSigner("other", "", time.Minute).verify("user-42", "reports/q1.docx", query.Get("exp"), query.Get("sig")); err == nil {
+		t.Fatal("accepted a link signed with a different secret")
+	}
+}
+
+func TestDownloadHandlerServesSignedFile(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := Files{workspace: workspace, maxBytes: 1024}
+	if err := files.Write("user-42", "notes.txt", "hello download", false); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{config: Config{}, access: NewAccessManager(Config{}), files: files, downloads: NewDownloadSigner("secret", "", time.Minute)}
+	link, _, err := app.downloads.URL("user-42", "notes.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, link, nil)
+	recorder := httptest.NewRecorder()
+	app.DownloadHandler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	body, _ := io.ReadAll(recorder.Result().Body)
+	if string(body) != "hello download" {
+		t.Fatalf("body = %q", body)
+	}
+	bad := httptest.NewRequest(http.MethodGet, "/download?w=user-42&p=notes.txt&exp=1&sig=x", nil)
+	badRecorder := httptest.NewRecorder()
+	app.DownloadHandler().ServeHTTP(badRecorder, bad)
+	if badRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid signature status = %d", badRecorder.Code)
+	}
+}
+
 func TestDocumentToolsUseVerifiedOfficeCLIArguments(t *testing.T) {
 	workspace, err := NewWorkspace(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	office := &recordingOffice{}
-	app := &App{config: Config{OfficeTimeout: "1s", StdioTenantID: "alice"}, files: Files{workspace: workspace, maxBytes: 1024}, officeEngine: office}
+	app := &App{config: Config{OfficeTimeout: "1s", StdioTenantID: "42"}, access: NewAccessManager(Config{}), files: Files{workspace: workspace, maxBytes: 1024}, officeEngine: office}
 	req := &mcp.CallToolRequest{}
 	if result, _, err := app.docCreate(context.Background(), req, docCreateInput{Path: "report.docx", Kind: "docx", Ops: json.RawMessage(`[{"command":"add"}]`)}); err != nil || result.IsError {
 		t.Fatalf("docCreate() = %+v, %v", result, err)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -14,8 +15,10 @@ import (
 type App struct {
 	config       Config
 	resolver     TenantResolver
+	access       *AccessManager
 	files        Files
 	officeEngine OfficeEngine
+	downloads    DownloadSigner
 }
 
 func New(config Config) (*App, error) {
@@ -23,27 +26,39 @@ func New(config Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{config: config, resolver: DeeixResolver{Secret: config.MCPUserContextSecret}, files: Files{workspace: workspace, maxBytes: config.MaxFileBytes, deleteEnabled: config.DeleteEnabled}, officeEngine: OfficeCLI{path: config.OfficeCLIPath}}, nil
+	return &App{
+		config:       config,
+		resolver:     DeeixResolver{Secret: config.MCPUserContextSecret},
+		access:       NewAccessManager(config),
+		files:        Files{workspace: workspace, maxBytes: config.MaxFileBytes, deleteEnabled: config.DeleteEnabled},
+		officeEngine: OfficeCLI{path: config.OfficeCLIPath},
+		downloads:    NewDownloadSigner(config.DownloadSecret, config.DownloadBaseURL, config.DownloadDuration()),
+	}, nil
 }
 
 func (a *App) Server() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "chat2work-mcp", Version: "0.1.0"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_list", Description: "List files in your own workspace."}, a.fsList)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_read", Description: "Read a file from your own workspace."}, a.fsRead)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_write", Description: "Atomically create or replace a file in your own workspace."}, a.fsWrite)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_edit", Description: "Replace exactly one text occurrence in a workspace file."}, a.fsEdit)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_move", Description: "Move a file within your own workspace."}, a.fsMove)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_delete", Description: "Delete one file from your own workspace when enabled by the administrator."}, a.fsDelete)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_search", Description: "Find files by glob pattern in your own workspace."}, a.fsSearch)
-	mcp.AddTool(server, &mcp.Tool{Name: "doc_create", Description: "Create an Office document in your own workspace using OfficeCLI."}, a.docCreate)
-	mcp.AddTool(server, &mcp.Tool{Name: "doc_edit", Description: "Apply OfficeCLI operations to a document in your own workspace."}, a.docEdit)
-	mcp.AddTool(server, &mcp.Tool{Name: "doc_query", Description: "Query an Office document in your own workspace using OfficeCLI JSON output."}, a.docQuery)
+	const workspaceNote = " Omit 'workspace' to use your private workspace; pass an administrator-assigned workspace id to operate on a shared one."
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_list", Description: "List files in a workspace." + workspaceNote}, a.fsList)
+	mcp.AddTool(server, &mcp.Tool{Name: "workspace_list", Description: "List the workspaces assigned to you by the administrator."}, a.workspaceList)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_read", Description: "Read a file from a workspace." + workspaceNote}, a.fsRead)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_write", Description: "Atomically create or replace a file in a workspace." + workspaceNote}, a.fsWrite)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_edit", Description: "Replace exactly one text occurrence in a workspace file." + workspaceNote}, a.fsEdit)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_move", Description: "Move a file within a workspace." + workspaceNote}, a.fsMove)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_delete", Description: "Delete one file from a workspace when enabled by the administrator." + workspaceNote}, a.fsDelete)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_search", Description: "Find files by glob pattern in a workspace." + workspaceNote}, a.fsSearch)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_link", Description: "Get a time-limited download link for a workspace file, so the user can save it." + workspaceNote}, a.fsLink)
+	mcp.AddTool(server, &mcp.Tool{Name: "doc_create", Description: "Create an Office document in a workspace using OfficeCLI." + workspaceNote}, a.docCreate)
+	mcp.AddTool(server, &mcp.Tool{Name: "doc_edit", Description: "Apply OfficeCLI operations to a document in a workspace." + workspaceNote}, a.docEdit)
+	mcp.AddTool(server, &mcp.Tool{Name: "doc_query", Description: "Query an Office document in a workspace using OfficeCLI JSON output." + workspaceNote}, a.docQuery)
 	return server
 }
 
 func (a *App) HTTPHandler() http.Handler {
-	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return a.Server() }, &mcp.StreamableHTTPOptions{Stateless: true})
-	return requireBearer(a.config.MCPToken, h)
+	mux := http.NewServeMux()
+	mux.Handle("/", requireBearer(a.config.MCPToken, mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return a.Server() }, &mcp.StreamableHTTPOptions{Stateless: true})))
+	mux.Handle("/download", a.DownloadHandler())
+	return mux
 }
 
 func (a *App) RunStdio(ctx context.Context) error {
@@ -53,14 +68,36 @@ func (a *App) RunStdio(ctx context.Context) error {
 	return a.Server().Run(ctx, &mcp.StdioTransport{})
 }
 
-func (a *App) tenant(req *mcp.CallToolRequest) (string, error) {
+func (a *App) identity(req *mcp.CallToolRequest) (Identity, error) {
 	if req.Extra != nil && req.Extra.Header != nil {
-		return tenantFromRequest(a.resolver, req.Extra.Header)
+		return identityFromRequest(a.resolver, req.Extra.Header)
 	}
 	if a.config.StdioTenantID != "" {
-		return a.config.StdioTenantID, nil
+		var id uint64
+		if _, err := fmt.Sscan(a.config.StdioTenantID, &id); err != nil || id == 0 {
+			return Identity{}, fmt.Errorf("stdio_tenant_id must be a numeric user id")
+		}
+		return Identity{UserID: id}, nil
 	}
-	return "", fmt.Errorf("authorization failed: signed user context is required")
+	return Identity{}, fmt.Errorf("authorization failed: signed user context is required")
+}
+
+func (a *App) grant(req *mcp.CallToolRequest, workspace string, write, remove bool) (WorkspaceGrant, error) {
+	identity, err := a.identity(req)
+	if err != nil {
+		return WorkspaceGrant{}, err
+	}
+	grant, err := a.access.Grant(identity.UserID, workspace)
+	if err != nil {
+		return WorkspaceGrant{}, err
+	}
+	if remove && !canDelete(grant.Access) {
+		return WorkspaceGrant{}, fmt.Errorf("workspace %q requires owner access for deletion", grant.ID)
+	}
+	if write && !canWrite(grant.Access) {
+		return WorkspaceGrant{}, fmt.Errorf("workspace %q is read-only", grant.ID)
+	}
+	return grant, nil
 }
 
 func textResult(value any) (*mcp.CallToolResult, any, error) {
@@ -75,134 +112,198 @@ func toolError(err error) (*mcp.CallToolResult, any, error) {
 }
 
 type pathInput struct {
-	Path string `json:"path" jsonschema:"relative workspace path"`
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path" jsonschema:"relative workspace path"`
 }
 type listInput struct {
+	Workspace string `json:"workspace,omitempty"`
 	Path      string `json:"path" jsonschema:"relative workspace path"`
 	Recursive bool   `json:"recursive,omitempty"`
 }
 type readInput struct {
-	Path     string `json:"path"`
-	MaxBytes int64  `json:"max_bytes,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path"`
+	MaxBytes  int64  `json:"max_bytes,omitempty"`
 }
 type writeInput struct {
+	Workspace string `json:"workspace,omitempty"`
 	Path      string `json:"path"`
 	Content   string `json:"content"`
 	Overwrite bool   `json:"overwrite,omitempty"`
 }
 type editInput struct {
-	Path    string `json:"path"`
-	OldText string `json:"old_text"`
-	NewText string `json:"new_text"`
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path"`
+	OldText   string `json:"old_text"`
+	NewText   string `json:"new_text"`
 }
 type moveInput struct {
+	Workspace   string `json:"workspace,omitempty"`
 	Source      string `json:"src"`
 	Destination string `json:"dst"`
 }
 type deleteInput struct {
-	Path    string `json:"path"`
-	Confirm bool   `json:"confirm"`
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path"`
+	Confirm   bool   `json:"confirm"`
 }
 type searchInput struct {
-	Pattern string `json:"pattern"`
-	Query   string `json:"query,omitempty"`
-	Path    string `json:"path,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+	Pattern   string `json:"pattern"`
+	Query     string `json:"query,omitempty"`
+	Path      string `json:"path,omitempty"`
+}
+type linkInput struct {
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path"`
 }
 
-func (a *App) fsList(_ context.Context, req *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+func (a *App) workspaceList(_ context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+	identity, err := a.identity(req)
 	if err != nil {
 		return toolError(err)
 	}
-	items, err := a.files.List(tenant, in.Path, in.Recursive)
+	return textResult(a.access.List(identity.UserID))
+}
+func (a *App) fsList(_ context.Context, req *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, any, error) {
+	grant, err := a.grant(req, in.Workspace, false, false)
+	if err != nil {
+		return toolError(err)
+	}
+	lock := a.access.Lock(grant.ID)
+	lock.RLock()
+	defer lock.RUnlock()
+	items, err := a.files.List(grant.ID, in.Path, in.Recursive)
 	if err != nil {
 		return toolError(err)
 	}
 	return textResult(items)
 }
 func (a *App) fsRead(_ context.Context, req *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, false, false)
 	if err != nil {
 		return toolError(err)
 	}
-	content, err := a.files.Read(tenant, in.Path, in.MaxBytes)
+	lock := a.access.Lock(grant.ID)
+	lock.RLock()
+	defer lock.RUnlock()
+	content, err := a.files.Read(grant.ID, in.Path, in.MaxBytes)
 	if err != nil {
 		return toolError(err)
 	}
 	return textResult(map[string]string{"content": string(content)})
 }
 func (a *App) fsWrite(_ context.Context, req *mcp.CallToolRequest, in writeInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, true, false)
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.files.Write(tenant, in.Path, in.Content, in.Overwrite); err != nil {
+	lock := a.access.Lock(grant.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := a.files.Write(grant.ID, in.Path, in.Content, in.Overwrite); err != nil {
 		return toolError(err)
 	}
 	return textResult(map[string]string{"status": "written"})
 }
 func (a *App) fsEdit(_ context.Context, req *mcp.CallToolRequest, in editInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, true, false)
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.files.Edit(tenant, in.Path, in.OldText, in.NewText); err != nil {
+	lock := a.access.Lock(grant.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := a.files.Edit(grant.ID, in.Path, in.OldText, in.NewText); err != nil {
 		return toolError(err)
 	}
 	return textResult(map[string]string{"status": "edited"})
 }
 func (a *App) fsMove(_ context.Context, req *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, true, false)
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.files.Move(tenant, in.Source, in.Destination); err != nil {
+	lock := a.access.Lock(grant.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := a.files.Move(grant.ID, in.Source, in.Destination); err != nil {
 		return toolError(err)
 	}
 	return textResult(map[string]string{"status": "moved"})
 }
 func (a *App) fsDelete(_ context.Context, req *mcp.CallToolRequest, in deleteInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, true, true)
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.files.Delete(tenant, in.Path, in.Confirm); err != nil {
+	lock := a.access.Lock(grant.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := a.files.Delete(grant.ID, in.Path, in.Confirm); err != nil {
 		return toolError(err)
 	}
 	return textResult(map[string]string{"status": "deleted"})
 }
 func (a *App) fsSearch(_ context.Context, req *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, false, false)
 	if err != nil {
 		return toolError(err)
 	}
 	if strings.TrimSpace(in.Pattern) == "" {
 		return toolError(fmt.Errorf("pattern is required"))
 	}
-	matches, err := a.files.Search(tenant, in.Pattern, in.Query, in.Path)
+	lock := a.access.Lock(grant.ID)
+	lock.RLock()
+	defer lock.RUnlock()
+	matches, err := a.files.Search(grant.ID, in.Pattern, in.Query, in.Path)
 	if err != nil {
 		return toolError(err)
 	}
 	return textResult(matches)
 }
+func (a *App) fsLink(_ context.Context, req *mcp.CallToolRequest, in linkInput) (*mcp.CallToolResult, any, error) {
+	grant, err := a.grant(req, in.Workspace, false, false)
+	if err != nil {
+		return toolError(err)
+	}
+	if err := a.documentPath(grant.ID, in.Path, false); err != nil {
+		return toolError(err)
+	}
+	cleanPath := filepath.ToSlash(filepath.Clean(in.Path))
+	link, expires, err := a.downloads.URL(grant.ID, cleanPath)
+	if err != nil {
+		return toolError(err)
+	}
+	return textResult(map[string]string{
+		"workspace":    grant.ID,
+		"path":         cleanPath,
+		"download_url": link,
+		"expires_at":   expires.UTC().Format(time.RFC3339),
+		"note":         "Present this link to the user. It expires and grants read access to this single file only.",
+	})
+}
 
 type docCreateInput struct {
+	Workspace string          `json:"workspace,omitempty"`
 	Path      string          `json:"path"`
 	Kind      string          `json:"kind"`
 	Overwrite bool            `json:"overwrite,omitempty"`
 	Ops       json.RawMessage `json:"ops,omitempty"`
 }
 type docEditInput struct {
-	Path string          `json:"path"`
-	Ops  json.RawMessage `json:"ops"`
+	Workspace string          `json:"workspace,omitempty"`
+	Path      string          `json:"path"`
+	Ops       json.RawMessage `json:"ops"`
 }
 type docQueryInput struct {
-	Path     string `json:"path"`
-	Selector string `json:"selector"`
+	Workspace string `json:"workspace,omitempty"`
+	Path      string `json:"path"`
+	Selector  string `json:"selector"`
 }
 
-func (a *App) runOffice(ctx context.Context, tenant string, args ...string) (*mcp.CallToolResult, any, error) {
-	root, err := a.files.workspace.Root(tenant)
+func (a *App) runOffice(ctx context.Context, workspace string, args ...string) (*mcp.CallToolResult, any, error) {
+	root, err := a.files.workspace.Root(workspace)
 	if err != nil {
 		return toolError(err)
 	}
@@ -215,11 +316,11 @@ func (a *App) runOffice(ctx context.Context, tenant string, args ...string) (*mc
 	return textResult(map[string]string{"output": output})
 }
 func (a *App) docCreate(ctx context.Context, req *mcp.CallToolRequest, in docCreateInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, true, false)
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.documentPath(tenant, in.Path, true); err != nil {
+	if err := a.documentPath(grant.ID, in.Path, true); err != nil {
 		return toolError(err)
 	}
 	if err := validateDocumentPath(in.Path, in.Kind); err != nil {
@@ -232,24 +333,30 @@ func (a *App) docCreate(ctx context.Context, req *mcp.CallToolRequest, in docCre
 	if in.Overwrite {
 		args = append(args, "--force")
 	}
-	result, _, err := a.runOffice(ctx, tenant, args...)
+	lock := a.access.Lock(grant.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	result, _, err := a.runOffice(ctx, grant.ID, args...)
 	if err != nil || len(in.Ops) == 0 || string(in.Ops) == "null" {
 		return result, nil, err
 	}
-	return a.runOffice(ctx, tenant, "batch", in.Path, "--commands", string(in.Ops))
+	return a.runOffice(ctx, grant.ID, "batch", in.Path, "--commands", string(in.Ops))
 }
 func (a *App) docEdit(ctx context.Context, req *mcp.CallToolRequest, in docEditInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, true, false)
 	if err != nil {
 		return toolError(err)
 	}
 	if !isJSONArray(in.Ops) {
 		return toolError(fmt.Errorf("ops must be a JSON array"))
 	}
-	if err := a.documentPath(tenant, in.Path, false); err != nil {
+	if err := a.documentPath(grant.ID, in.Path, false); err != nil {
 		return toolError(err)
 	}
-	return a.runOffice(ctx, tenant, "batch", in.Path, "--commands", string(in.Ops))
+	lock := a.access.Lock(grant.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return a.runOffice(ctx, grant.ID, "batch", in.Path, "--commands", string(in.Ops))
 }
 
 func isJSONArray(raw json.RawMessage) bool {
@@ -268,14 +375,17 @@ func validateDocumentPath(path, kind string) error {
 	return nil
 }
 func (a *App) docQuery(ctx context.Context, req *mcp.CallToolRequest, in docQueryInput) (*mcp.CallToolResult, any, error) {
-	tenant, err := a.tenant(req)
+	grant, err := a.grant(req, in.Workspace, false, false)
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.documentPath(tenant, in.Path, false); err != nil {
+	if err := a.documentPath(grant.ID, in.Path, false); err != nil {
 		return toolError(err)
 	}
-	return a.runOffice(ctx, tenant, "query", in.Path, in.Selector, "--json")
+	lock := a.access.Lock(grant.ID)
+	lock.RLock()
+	defer lock.RUnlock()
+	return a.runOffice(ctx, grant.ID, "query", in.Path, in.Selector, "--json")
 }
 
 func (a *App) documentPath(tenant, path string, allowMissing bool) error {
