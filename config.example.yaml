@@ -7,6 +7,7 @@ max_workspace_bytes: 1073741824
 max_workspace_files: 10000
 max_list_results: 1000
 max_search_results: 200
+# Bundled in the image at a pinned version; resolved from PATH by default.
 officecli_path: "officecli"
 office_timeout: "60s"
 delete_enabled: false

@@ -49,26 +49,21 @@ This is the current delivery path. Landing artifacts directly in DEEIX's user qu
 
 1. Start DEEIX first so the `deeix-chat-network` external network exists.
 2. Copy `config.example.yaml` to `config.yaml`. Set a long, random `mcp_token` and set `mcp_user_context_secret` to exactly the same value as DEEIX's `security.mcp_user_context_secret` / `MCP_USER_CONTEXT_SECRET`.
-3. Place an audited, version-pinned **Linux** OfficeCLI binary at `bin/officecli`, mark it executable, and keep `OFFICECLI_SKIP_UPDATE=1` enabled. The supplied Compose file mounts it read-only; it does not fetch `latest` during a build. `D:\OfficeCli\officecli.exe` is suitable for Windows M0 testing, not for the Linux container. This repository is validated against `officecli-linux-alpine-x64` v1.0.149 (sha256 `b0129f315d744f1ddd64029b5f5d3244627ac3a9322007b01f6bf273924767d9`); `bin/` is gitignored, so download it during deployment:
-
-```sh
-mkdir -p bin
-curl -sL -o bin/officecli https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.149/officecli-linux-alpine-x64
-chmod +x bin/officecli
-```
-4. From this directory, start the service:
+3. Build and start the service. OfficeCLI is bundled into the image at a pinned version and verified by SHA256 during the build; you do not place a binary by hand.
 
 ```sh
 docker compose -f docker-compose.yml up -d --build
 ```
 
-5. In DEEIX, add a Streamable HTTP MCP server using URL `http://chat2work-mcp:8090/`. Put the configured `mcp_token` in the admin authentication-key field (DEEIX generates `Authorization: Bearer ...`), and add only this request header:
+`docker compose up` builds for the host architecture automatically. For ARM64 or a multi-arch registry image, use `buildx` (see Multi-arch builds below).
+
+4. In DEEIX, add a Streamable HTTP MCP server using URL `http://chat2work-mcp:8090/`. Put the configured `mcp_token` in the admin authentication-key field (DEEIX generates `Authorization: Bearer ...`), and add only this request header:
 
 ```text
 X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 ```
 
-6. Sync tools and enable the `fs_*`, `doc_*`, and `workspace_list` tools you want.
+5. Sync tools and enable the `fs_*`, `doc_*`, and `workspace_list` tools you want.
 
 The service stays on `deeix-chat-network` and publishes only `127.0.0.1:8090` for your reverse proxy. Route `/chat2work/` (or a subdomain) to it and set `download_base_url` accordingly.
 
@@ -80,17 +75,44 @@ Every YAML setting may be overridden by its uppercase environment name: `LISTEN_
 
 Resource controls are enforced per workspace: `max_workspace_bytes` and `max_workspace_files` gate writes, and `max_list_results` / `max_search_results` bound `fs_list` and `fs_search` (the results include a `truncated` flag). When `audit_log_path` is set, every tool call appends one JSON Lines record (user, workspace, tool, path, outcome, duration, result size) with no file content or secrets.
 
-## OfficeCLI M0 Checklist
+## OfficeCLI: bundled, pinned, and multi-arch
 
-The Windows M0 validation used OfficeCLI `1.0.148` and established these contracts:
+OfficeCLI is baked into the runtime image, not mounted. The Dockerfile downloads the matching release asset for the build target, verifies it against a pinned SHA256, and marks it executable. `OFFICECLI_SKIP_UPDATE=1` and `OFFICECLI_RESIDENT_FLUSH=each` are set on every invocation.
+
+Two facts learned from the real binary matter for packaging:
+
+- It is a self-contained .NET single-file executable, but **not statically linked**. The runtime image must ship `libstdc++` (which provides `libgcc_s`) and `icu-libs`. Without them it aborts with `libstdc++.so.6 not found` / `Could not find a valid ICU package`.
+- It is a real binary, not an installer. No post-download install step is needed.
+
+Pinned assets for `v1.0.149` (Alpine, musl):
+
+| Arch | Asset | SHA256 |
+|---|---|---|
+| amd64 | `officecli-linux-alpine-x64` | `b0129f315d744f1ddd64029b5f5d3244627ac3a9322007b01f6bf273924767d9` |
+| arm64 | `officecli-linux-alpine-arm64` | `ecd319f19e0beb524a3a0961d85b552b332dc1836592b4f1bcbaca61b86f05fd` |
+
+The Dockerfile selects the asset from the BuildKit `TARGETARCH`, so a normal `docker build` on an ARM64 host produces an ARM64 image. To publish a multi-arch registry image:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/chat2work-mcp:<tag> --push .
+```
+
+### Version policy: pin, do not auto-update
+
+Pin the OfficeCLI version. Auto-updating a document engine inside a long-running service is a supply-chain and reproducibility risk: the same image could start producing different OOXML over time, and a bad release would silently affect every tenant. Updating is a deliberate act: bump `OFFICECLI_VERSION` and the two checksums in the Dockerfile, rebuild, and re-run the smoke tests. This can be automated by a scheduled CI job that opens a pull request when a new release appears, while the deployed image stays pinned until reviewed.
+
+## OfficeCLI validation record
+
+Validated against `officecli-linux-alpine-x64` v1.0.149 inside `alpine:3.22` with `libstdc++` and `icu-libs`:
 
 - `create <file>` infers document type from `.docx`, `.xlsx`, or `.pptx`; it has no `--kind` or `--content` parameter.
 - `batch <file> --commands <JSON-array>` is the supported bulk-edit invocation. `ops` supplied to the MCP is forwarded as that JSON array.
 - Successful `create` and `batch` calls may start a resident process. The server explicitly calls `close` after each, forcing a flush and preventing cross-request resident state.
-- DOCX create, paragraph batch edit, close, and `query --json` succeeded. Empty XLSX and PPTX create/close succeeded.
+- `create`/`close` succeeded for `.docx`, `.xlsx`, and `.pptx`; `--locale zh-CN` creation succeeded; DOCX `query --json` succeeded.
+- End-to-end through the built image: signed `fs_write`, `fs_list`, `doc_create`, `fs_link`, and a signed download all succeeded.
 - PDF conversion is unavailable without an OfficeCLI exporter plugin.
 
-Before enabling the Office tools in production, repeat and record these checks against the pinned Linux binary: `create`/`batch --commands`/`close`/`query --json`, `OFFICECLI_SKIP_UPDATE=1`, DOCX/XLSX/PPTX smoke tests, large-XLSX resource measurements, and any PDF exporter plugins.
+Before enabling the Office tools in production, repeat and record these checks against the pinned binary: `create`/`batch --commands`/`close`/`query --json`, `OFFICECLI_SKIP_UPDATE=1`, DOCX/XLSX/PPTX smoke tests, large-XLSX resource measurements, and any PDF exporter plugins.
 
 ## Development
 

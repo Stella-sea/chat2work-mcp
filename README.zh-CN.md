@@ -49,26 +49,21 @@ download_ttl: "15m"
 
 1. 先启动 DEEIX，以创建外部网络 `deeix-chat-network`。
 2. 复制 `config.example.yaml` 为 `config.yaml`。设置一个长随机 `mcp_token`，并把 `mcp_user_context_secret` 设为与 DEEIX 的 `security.mcp_user_context_secret` / `MCP_USER_CONTEXT_SECRET` 完全相同的值。
-3. 将经审计、固定版本的 **Linux** OfficeCLI 二进制放到 `bin/officecli`，赋予可执行权限，并保持 `OFFICECLI_SKIP_UPDATE=1`。Compose 会只读挂载它，不会在构建时拉取 `latest`。`D:\OfficeCli\officecli.exe` 仅适合 Windows M0 测试，不能用于 Linux 容器。本项目验证的是 `officecli-linux-alpine-x64` v1.0.149（sha256 `b0129f315d744f1ddd64029b5f5d3244627ac3a9322007b01f6bf273924767d9`）；`bin/` 已被 gitignore，部署时自行下载：
-
-```sh
-mkdir -p bin
-curl -sL -o bin/officecli https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.149/officecli-linux-alpine-x64
-chmod +x bin/officecli
-```
-4. 在本目录启动服务：
+3. 构建并启动服务。OfficeCLI 以固定版本内置于镜像，构建时用 SHA256 校验，无需手动放置二进制。
 
 ```sh
 docker compose -f docker-compose.yml up -d --build
 ```
 
-5. 在 DEEIX 中添加 Streamable HTTP MCP 服务，URL 为 `http://chat2work-mcp:8090/`。把配置的 `mcp_token` 填入后台的鉴权密钥字段（DEEIX 会生成 `Authorization: Bearer ...`），请求头只需添加：
+`docker compose up` 会自动按宿主机架构构建。ARM64 或多架构镜像请用 `buildx`（见下文多架构构建）。
+
+4. 在 DEEIX 中添加 Streamable HTTP MCP 服务，URL 为 `http://chat2work-mcp:8090/`。把配置的 `mcp_token` 填入后台的鉴权密钥字段（DEEIX 会生成 `Authorization: Bearer ...`），请求头只需添加：
 
 ```text
 X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 ```
 
-6. 同步工具，并按需启用 `fs_*`、`doc_*` 和 `workspace_list`。
+5. 同步工具，并按需启用 `fs_*`、`doc_*` 和 `workspace_list`。
 
 服务仅加入 `deeix-chat-network`，并只发布 `127.0.0.1:8090` 给反向代理。把 `/chat2work/`（或子域名）转发到它，并相应设置 `download_base_url`。
 
@@ -80,17 +75,44 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 
 资源控制按工作区生效：`max_workspace_bytes` 与 `max_workspace_files` 约束写入，`max_list_results` 与 `max_search_results` 约束 `fs_list` 和 `fs_search`（结果含 `truncated` 标记）。设置 `audit_log_path` 后，每次工具调用追加一条 JSON Lines 记录（用户、工作区、工具、路径、结果、耗时、结果大小），不含文件内容或密钥。
 
-## OfficeCLI M0 验证
+## OfficeCLI：内置、固定版本、多架构
 
-Windows M0 使用 OfficeCLI `1.0.148`，确认了以下契约：
+OfficeCLI 内置在运行镜像中，不再挂载。Dockerfile 会按构建目标下载对应 release 资产、用固定 SHA256 校验、赋予可执行权限，并在每次调用时设置 `OFFICECLI_SKIP_UPDATE=1` 与 `OFFICECLI_RESIDENT_FLUSH=each`。
+
+实测二进制带来的两个打包要点：
+
+- 它是自包含的 .NET 单文件程序，但**并非静态链接**。运行镜像必须包含 `libstdc++`（提供 `libgcc_s`）与 `icu-libs`。缺少时会分别报 `libstdc++.so.6 not found` 与 `Could not find a valid ICU package`。
+- 它是真正的二进制，不是安装器，下载后无需再执行安装步骤。
+
+`v1.0.149` 固定资产（Alpine / musl）：
+
+| 架构 | 资产 | SHA256 |
+|---|---|---|
+| amd64 | `officecli-linux-alpine-x64` | `b0129f315d744f1ddd64029b5f5d3244627ac3a9322007b01f6bf273924767d9` |
+| arm64 | `officecli-linux-alpine-arm64` | `ecd319f19e0beb524a3a0961d85b552b332dc1836592b4f1bcbaca61b86f05fd` |
+
+Dockerfile 依据 BuildKit 的 `TARGETARCH` 选择资产，因此在 ARM64 宿主机上普通 `docker build` 即可产出 ARM64 镜像。发布多架构镜像：
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/chat2work-mcp:<tag> --push .
+```
+
+### 版本策略：固定，不自动更新
+
+固定 OfficeCLI 版本。在常驻服务里自动更新文档引擎是供应链与可复现性风险：同一镜像可能随时间产出不同 OOXML，坏版本会静默影响所有租户。更新应是显式动作：改 Dockerfile 里的 `OFFICECLI_VERSION` 与两个校验值，重新构建，重跑冒烟测试。可用定时 CI 在出现新版本时自动开 PR，但已部署镜像保持固定直到评审通过。
+
+## OfficeCLI 验证记录
+
+在 `alpine:3.22` + `libstdc++` + `icu-libs` 中，针对 `officecli-linux-alpine-x64` v1.0.149 验证：
 
 - `create <file>` 由 `.docx`、`.xlsx`、`.pptx` 后缀推断类型，没有 `--kind`、`--content` 参数。
 - `batch <file> --commands <JSON 数组>` 是受支持的批量编辑调用；MCP 的 `ops` 就作为该 JSON 数组转发。
 - 成功的 `create` 与 `batch` 可能启动 resident 进程。服务端在每次调用后显式 `close`，强制落盘并避免跨请求保留 resident 状态。
-- DOCX 创建、段落批处理、close、`query --json` 均成功；空 XLSX 与 PPTX 创建/关闭成功。
+- `.docx`、`.xlsx`、`.pptx` 的 `create`/`close` 均成功；`--locale zh-CN` 创建成功；DOCX `query --json` 成功。
+- 通过构建出的镜像端到端验证：签名 `fs_write`、`fs_list`、`doc_create`、`fs_link` 与签名下载均成功。
 - 未安装 OfficeCLI 导出插件时无法转换 PDF。
 
-生产启用 Office 工具前，请针对固定版本的 Linux 二进制重复并记录：`create`/`batch --commands`/`close`/`query --json`、`OFFICECLI_SKIP_UPDATE=1`、DOCX/XLSX/PPTX 冒烟测试、大 XLSX 资源占用，以及 PDF 导出插件情况。
+生产启用 Office 工具前，请针对固定版本的二进制重复并记录：`create`/`batch --commands`/`close`/`query --json`、`OFFICECLI_SKIP_UPDATE=1`、DOCX/XLSX/PPTX 冒烟测试、大 XLSX 资源占用，以及 PDF 导出插件情况。
 
 ## 开发
 
