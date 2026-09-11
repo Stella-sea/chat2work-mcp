@@ -21,6 +21,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer server.Close()
 	if *stdio {
 		if err := server.RunStdio(context.Background()); err != nil {
 			log.Fatal(err)

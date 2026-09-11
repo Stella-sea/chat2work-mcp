@@ -49,7 +49,13 @@ download_ttl: "15m"
 
 1. 先启动 DEEIX，以创建外部网络 `deeix-chat-network`。
 2. 复制 `config.example.yaml` 为 `config.yaml`。设置一个长随机 `mcp_token`，并把 `mcp_user_context_secret` 设为与 DEEIX 的 `security.mcp_user_context_secret` / `MCP_USER_CONTEXT_SECRET` 完全相同的值。
-3. 将经审计、固定版本的 **Linux** OfficeCLI 二进制放到 `bin/officecli`，赋予可执行权限，并保持 `OFFICECLI_SKIP_UPDATE=1`。Compose 会只读挂载它，不会在构建时拉取 `latest`。`D:\OfficeCli\officecli.exe` 仅适合 Windows M0 测试，不能用于 Linux 容器。
+3. 将经审计、固定版本的 **Linux** OfficeCLI 二进制放到 `bin/officecli`，赋予可执行权限，并保持 `OFFICECLI_SKIP_UPDATE=1`。Compose 会只读挂载它，不会在构建时拉取 `latest`。`D:\OfficeCli\officecli.exe` 仅适合 Windows M0 测试，不能用于 Linux 容器。本项目验证的是 `officecli-linux-alpine-x64` v1.0.149（sha256 `b0129f315d744f1ddd64029b5f5d3244627ac3a9322007b01f6bf273924767d9`）；`bin/` 已被 gitignore，部署时自行下载：
+
+```sh
+mkdir -p bin
+curl -sL -o bin/officecli https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.149/officecli-linux-alpine-x64
+chmod +x bin/officecli
+```
 4. 在本目录启动服务：
 
 ```sh
@@ -71,6 +77,8 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 每个 YAML 配置都可用大写环境变量覆盖：`LISTEN_ADDR`、`MCP_TOKEN`、`MCP_USER_CONTEXT_SECRET`、`WORKSPACE_ROOT`、`MAX_FILE_BYTES`、`MAX_WORKSPACE_BYTES`、`MAX_WORKSPACE_FILES`、`MAX_LIST_RESULTS`、`MAX_SEARCH_RESULTS`、`OFFICECLI_PATH`、`OFFICE_TIMEOUT`、`DELETE_ENABLED`、`AUDIT_LOG_PATH`、`DOWNLOAD_BASE_URL`、`DOWNLOAD_TTL`、`DOWNLOAD_SECRET`、`STDIO_TENANT_ID`。
 
 `fs_delete` 默认禁用，且从不删除目录。`fs_write` 使用临时文件加 rename 原子写入。`fs_edit` 要求 `old_text` 精确匹配且唯一，否则报错。
+
+资源控制按工作区生效：`max_workspace_bytes` 与 `max_workspace_files` 约束写入，`max_list_results` 与 `max_search_results` 约束 `fs_list` 和 `fs_search`（结果含 `truncated` 标记）。设置 `audit_log_path` 后，每次工具调用追加一条 JSON Lines 记录（用户、工作区、工具、路径、结果、耗时、结果大小），不含文件内容或密钥。
 
 ## OfficeCLI M0 验证
 

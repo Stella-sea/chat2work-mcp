@@ -49,7 +49,13 @@ This is the current delivery path. Landing artifacts directly in DEEIX's user qu
 
 1. Start DEEIX first so the `deeix-chat-network` external network exists.
 2. Copy `config.example.yaml` to `config.yaml`. Set a long, random `mcp_token` and set `mcp_user_context_secret` to exactly the same value as DEEIX's `security.mcp_user_context_secret` / `MCP_USER_CONTEXT_SECRET`.
-3. Place an audited, version-pinned **Linux** OfficeCLI binary at `bin/officecli`, mark it executable, and keep `OFFICECLI_SKIP_UPDATE=1` enabled. The supplied Compose file mounts it read-only; it does not fetch `latest` during a build. `D:\OfficeCli\officecli.exe` is suitable for Windows M0 testing, not for the Linux container.
+3. Place an audited, version-pinned **Linux** OfficeCLI binary at `bin/officecli`, mark it executable, and keep `OFFICECLI_SKIP_UPDATE=1` enabled. The supplied Compose file mounts it read-only; it does not fetch `latest` during a build. `D:\OfficeCli\officecli.exe` is suitable for Windows M0 testing, not for the Linux container. This repository is validated against `officecli-linux-alpine-x64` v1.0.149 (sha256 `b0129f315d744f1ddd64029b5f5d3244627ac3a9322007b01f6bf273924767d9`); `bin/` is gitignored, so download it during deployment:
+
+```sh
+mkdir -p bin
+curl -sL -o bin/officecli https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.149/officecli-linux-alpine-x64
+chmod +x bin/officecli
+```
 4. From this directory, start the service:
 
 ```sh
@@ -71,6 +77,8 @@ The service stays on `deeix-chat-network` and publishes only `127.0.0.1:8090` fo
 Every YAML setting may be overridden by its uppercase environment name: `LISTEN_ADDR`, `MCP_TOKEN`, `MCP_USER_CONTEXT_SECRET`, `WORKSPACE_ROOT`, `MAX_FILE_BYTES`, `MAX_WORKSPACE_BYTES`, `MAX_WORKSPACE_FILES`, `MAX_LIST_RESULTS`, `MAX_SEARCH_RESULTS`, `OFFICECLI_PATH`, `OFFICE_TIMEOUT`, `DELETE_ENABLED`, `AUDIT_LOG_PATH`, `DOWNLOAD_BASE_URL`, `DOWNLOAD_TTL`, `DOWNLOAD_SECRET`, and `STDIO_TENANT_ID`.
 
 `fs_delete` defaults to disabled and never removes directories. `fs_write` uses a temporary file plus rename. `fs_edit` fails unless `old_text` appears exactly once.
+
+Resource controls are enforced per workspace: `max_workspace_bytes` and `max_workspace_files` gate writes, and `max_list_results` / `max_search_results` bound `fs_list` and `fs_search` (the results include a `truncated` flag). When `audit_log_path` is set, every tool call appends one JSON Lines record (user, workspace, tool, path, outcome, duration, result size) with no file content or secrets.
 
 ## OfficeCLI M0 Checklist
 

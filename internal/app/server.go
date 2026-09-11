@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ type App struct {
 	files        Files
 	officeEngine OfficeEngine
 	downloads    DownloadSigner
+	audit        *Auditor
 }
 
 func New(config Config) (*App, error) {
@@ -26,31 +28,45 @@ func New(config Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	auditor, err := NewAuditor(config.AuditLogPath)
+	if err != nil {
+		return nil, fmt.Errorf("open audit log: %w", err)
+	}
 	return &App{
-		config:       config,
-		resolver:     DeeixResolver{Secret: config.MCPUserContextSecret},
-		access:       NewAccessManager(config),
-		files:        Files{workspace: workspace, maxBytes: config.MaxFileBytes, deleteEnabled: config.DeleteEnabled},
+		config:   config,
+		resolver: DeeixResolver{Secret: config.MCPUserContextSecret},
+		access:   NewAccessManager(config),
+		files: Files{
+			workspace:         workspace,
+			maxBytes:          config.MaxFileBytes,
+			maxWorkspaceBytes: config.MaxWorkspaceBytes,
+			maxWorkspaceFiles: config.MaxWorkspaceFiles,
+			deleteEnabled:     config.DeleteEnabled,
+		},
 		officeEngine: OfficeCLI{path: config.OfficeCLIPath},
 		downloads:    NewDownloadSigner(config.DownloadSecret, config.DownloadBaseURL, config.DownloadDuration()),
+		audit:        auditor,
 	}, nil
 }
+
+// Close releases the audit log file.
+func (a *App) Close() error { return a.audit.Close() }
 
 func (a *App) Server() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "chat2work-mcp", Version: "0.1.0"}, nil)
 	const workspaceNote = " Omit 'workspace' to use your private workspace; pass an administrator-assigned workspace id to operate on a shared one."
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_list", Description: "List files in a workspace." + workspaceNote}, a.fsList)
-	mcp.AddTool(server, &mcp.Tool{Name: "workspace_list", Description: "List the workspaces assigned to you by the administrator."}, a.workspaceList)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_read", Description: "Read a file from a workspace." + workspaceNote}, a.fsRead)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_write", Description: "Atomically create or replace a file in a workspace." + workspaceNote}, a.fsWrite)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_edit", Description: "Replace exactly one text occurrence in a workspace file." + workspaceNote}, a.fsEdit)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_move", Description: "Move a file within a workspace." + workspaceNote}, a.fsMove)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_delete", Description: "Delete one file from a workspace when enabled by the administrator." + workspaceNote}, a.fsDelete)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_search", Description: "Find files by glob pattern in a workspace." + workspaceNote}, a.fsSearch)
-	mcp.AddTool(server, &mcp.Tool{Name: "fs_link", Description: "Get a time-limited download link for a workspace file, so the user can save it." + workspaceNote}, a.fsLink)
-	mcp.AddTool(server, &mcp.Tool{Name: "doc_create", Description: "Create an Office document in a workspace using OfficeCLI." + workspaceNote}, a.docCreate)
-	mcp.AddTool(server, &mcp.Tool{Name: "doc_edit", Description: "Apply OfficeCLI operations to a document in a workspace." + workspaceNote}, a.docEdit)
-	mcp.AddTool(server, &mcp.Tool{Name: "doc_query", Description: "Query an Office document in a workspace using OfficeCLI JSON output." + workspaceNote}, a.docQuery)
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_list", Description: "List files in a workspace." + workspaceNote}, instrument(a, "fs_list", a.fsList))
+	mcp.AddTool(server, &mcp.Tool{Name: "workspace_list", Description: "List the workspaces assigned to you by the administrator."}, instrument(a, "workspace_list", a.workspaceList))
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_read", Description: "Read a file from a workspace." + workspaceNote}, instrument(a, "fs_read", a.fsRead))
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_write", Description: "Atomically create or replace a file in a workspace." + workspaceNote}, instrument(a, "fs_write", a.fsWrite))
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_edit", Description: "Replace exactly one text occurrence in a workspace file." + workspaceNote}, instrument(a, "fs_edit", a.fsEdit))
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_move", Description: "Move a file within a workspace." + workspaceNote}, instrument(a, "fs_move", a.fsMove))
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_delete", Description: "Delete one file from a workspace when enabled by the administrator." + workspaceNote}, instrument(a, "fs_delete", a.fsDelete))
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_search", Description: "Find files by glob pattern in a workspace." + workspaceNote}, instrument(a, "fs_search", a.fsSearch))
+	mcp.AddTool(server, &mcp.Tool{Name: "fs_link", Description: "Get a time-limited download link for a workspace file, so the user can save it." + workspaceNote}, instrument(a, "fs_link", a.fsLink))
+	mcp.AddTool(server, &mcp.Tool{Name: "doc_create", Description: "Create an Office document in a workspace using OfficeCLI." + workspaceNote}, instrument(a, "doc_create", a.docCreate))
+	mcp.AddTool(server, &mcp.Tool{Name: "doc_edit", Description: "Apply OfficeCLI operations to a document in a workspace." + workspaceNote}, instrument(a, "doc_edit", a.docEdit))
+	mcp.AddTool(server, &mcp.Tool{Name: "doc_query", Description: "Query an Office document in a workspace using OfficeCLI JSON output." + workspaceNote}, instrument(a, "doc_query", a.docQuery))
 	return server
 }
 
@@ -173,11 +189,11 @@ func (a *App) fsList(_ context.Context, req *mcp.CallToolRequest, in listInput) 
 	lock := a.access.Lock(grant.ID)
 	lock.RLock()
 	defer lock.RUnlock()
-	items, err := a.files.List(grant.ID, in.Path, in.Recursive)
+	items, truncated, err := a.files.List(grant.ID, in.Path, in.Recursive, a.config.MaxListResults)
 	if err != nil {
 		return toolError(err)
 	}
-	return textResult(items)
+	return textResult(map[string]any{"items": items, "truncated": truncated, "limit": a.config.MaxListResults})
 }
 func (a *App) fsRead(_ context.Context, req *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, any, error) {
 	grant, err := a.grant(req, in.Workspace, false, false)
@@ -256,18 +272,18 @@ func (a *App) fsSearch(_ context.Context, req *mcp.CallToolRequest, in searchInp
 	lock := a.access.Lock(grant.ID)
 	lock.RLock()
 	defer lock.RUnlock()
-	matches, err := a.files.Search(grant.ID, in.Pattern, in.Query, in.Path)
+	matches, truncated, err := a.files.Search(grant.ID, in.Pattern, in.Query, in.Path, a.config.MaxSearchResults)
 	if err != nil {
 		return toolError(err)
 	}
-	return textResult(matches)
+	return textResult(map[string]any{"matches": matches, "truncated": truncated, "limit": a.config.MaxSearchResults})
 }
 func (a *App) fsLink(_ context.Context, req *mcp.CallToolRequest, in linkInput) (*mcp.CallToolResult, any, error) {
 	grant, err := a.grant(req, in.Workspace, false, false)
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.documentPath(grant.ID, in.Path, false); err != nil {
+	if _, err := a.documentPath(grant.ID, in.Path, false); err != nil {
 		return toolError(err)
 	}
 	cleanPath := filepath.ToSlash(filepath.Clean(in.Path))
@@ -320,10 +336,18 @@ func (a *App) docCreate(ctx context.Context, req *mcp.CallToolRequest, in docCre
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.documentPath(grant.ID, in.Path, true); err != nil {
+	resolved, err := a.documentPath(grant.ID, in.Path, true)
+	if err != nil {
 		return toolError(err)
 	}
 	if err := validateDocumentPath(in.Path, in.Kind); err != nil {
+		return toolError(err)
+	}
+	isNew := true
+	if _, statErr := os.Stat(resolved); statErr == nil {
+		isNew = false
+	}
+	if err := a.files.CheckWriteAllowed(grant.ID, isNew); err != nil {
 		return toolError(err)
 	}
 	if len(in.Ops) > 0 && string(in.Ops) != "null" && !isJSONArray(in.Ops) {
@@ -350,7 +374,7 @@ func (a *App) docEdit(ctx context.Context, req *mcp.CallToolRequest, in docEditI
 	if !isJSONArray(in.Ops) {
 		return toolError(fmt.Errorf("ops must be a JSON array"))
 	}
-	if err := a.documentPath(grant.ID, in.Path, false); err != nil {
+	if _, err := a.documentPath(grant.ID, in.Path, false); err != nil {
 		return toolError(err)
 	}
 	lock := a.access.Lock(grant.ID)
@@ -379,7 +403,7 @@ func (a *App) docQuery(ctx context.Context, req *mcp.CallToolRequest, in docQuer
 	if err != nil {
 		return toolError(err)
 	}
-	if err := a.documentPath(grant.ID, in.Path, false); err != nil {
+	if _, err := a.documentPath(grant.ID, in.Path, false); err != nil {
 		return toolError(err)
 	}
 	lock := a.access.Lock(grant.ID)
@@ -388,11 +412,11 @@ func (a *App) docQuery(ctx context.Context, req *mcp.CallToolRequest, in docQuer
 	return a.runOffice(ctx, grant.ID, "query", in.Path, in.Selector, "--json")
 }
 
-func (a *App) documentPath(tenant, path string, allowMissing bool) error {
+func (a *App) documentPath(tenant, path string, allowMissing bool) (string, error) {
 	root, err := a.files.workspace.Root(tenant)
 	if err != nil {
-		return err
+		return "", err
 	}
-	_, err = resolve(root, path, allowMissing)
-	return friendlyPathError(err)
+	resolved, err := resolve(root, path, allowMissing)
+	return resolved, friendlyPathError(err)
 }

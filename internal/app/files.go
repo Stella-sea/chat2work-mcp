@@ -12,28 +12,35 @@ import (
 )
 
 type Files struct {
-	workspace     *Workspace
-	maxBytes      int64
-	deleteEnabled bool
+	workspace         *Workspace
+	maxBytes          int64
+	maxWorkspaceBytes int64
+	maxWorkspaceFiles int
+	deleteEnabled     bool
 }
 
-func (f Files) List(tenant, path string, recursive bool) ([]string, error) {
+// errLimitReached stops a directory walk once a configured cap is hit. It never
+// leaves the package.
+var errLimitReached = errors.New("walk limit reached")
+
+func (f Files) List(tenant, path string, recursive bool, limit int) ([]string, bool, error) {
 	root, err := f.workspace.Root(tenant)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	target, err := resolve(root, path, false)
 	if err != nil {
-		return nil, friendlyPathError(err)
+		return nil, false, friendlyPathError(err)
 	}
 	info, err := os.Stat(target)
 	if err != nil {
-		return nil, friendlyPathError(err)
+		return nil, false, friendlyPathError(err)
 	}
 	if !info.IsDir() {
-		return nil, errors.New("path is not a directory")
+		return nil, false, errors.New("path is not a directory")
 	}
 	var items []string
+	truncated := false
 	if recursive {
 		err = filepath.WalkDir(target, func(item string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
@@ -44,8 +51,15 @@ func (f Files) List(tenant, path string, recursive bool) ([]string, error) {
 			}
 			rel, _ := filepath.Rel(root, item)
 			items = append(items, filepath.ToSlash(rel))
+			if limit > 0 && len(items) >= limit {
+				truncated = true
+				return errLimitReached
+			}
 			return nil
 		})
+		if errors.Is(err, errLimitReached) {
+			err = nil
+		}
 	} else {
 		entries, listErr := os.ReadDir(target)
 		err = listErr
@@ -56,9 +70,13 @@ func (f Files) List(tenant, path string, recursive bool) ([]string, error) {
 				name += "/"
 			}
 			items = append(items, name)
+			if limit > 0 && len(items) >= limit {
+				truncated = true
+				break
+			}
 		}
 	}
-	return items, err
+	return items, truncated, err
 }
 
 func (f Files) Read(tenant, path string, maxBytes int64) ([]byte, error) {
@@ -110,6 +128,15 @@ func (f Files) Write(tenant, path, content string, overwrite bool) error {
 			return err
 		}
 	}
+	var existingSize int64
+	isNew := true
+	if info, statErr := os.Stat(target); statErr == nil {
+		existingSize = info.Size()
+		isNew = false
+	}
+	if err := f.enforceQuota(root, int64(len(content)), existingSize, isNew); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
 		return err
 	}
@@ -131,6 +158,81 @@ func (f Files) Write(tenant, path, content string, overwrite bool) error {
 		return err
 	}
 	return os.Rename(tmpName, target)
+}
+
+// enforceQuota checks the per-workspace byte and file-count caps before a write.
+// Usage is measured with an early-abort walk, so it stays bounded even when the
+// workspace is already over quota.
+func (f Files) enforceQuota(root string, newSize, existingSize int64, isNew bool) error {
+	if f.maxWorkspaceBytes <= 0 && f.maxWorkspaceFiles <= 0 {
+		return nil
+	}
+	used, count, err := f.usage(root)
+	if err != nil {
+		return err
+	}
+	if f.maxWorkspaceBytes > 0 && used-existingSize+newSize > f.maxWorkspaceBytes {
+		return fmt.Errorf("workspace storage quota exceeded (%d bytes)", f.maxWorkspaceBytes)
+	}
+	if isNew && f.maxWorkspaceFiles > 0 && count >= f.maxWorkspaceFiles {
+		return fmt.Errorf("workspace file count quota exceeded (%d files)", f.maxWorkspaceFiles)
+	}
+	return nil
+}
+
+// CheckWriteAllowed applies a coarse pre-check for writes whose final size is
+// unknown (for example OfficeCLI-created documents): reject when the workspace
+// is already over the byte cap, and reject a new file when the count cap is
+// reached.
+func (f Files) CheckWriteAllowed(tenant string, isNew bool) error {
+	if f.maxWorkspaceBytes <= 0 && f.maxWorkspaceFiles <= 0 {
+		return nil
+	}
+	root, err := f.workspace.Root(tenant)
+	if err != nil {
+		return err
+	}
+	used, count, err := f.usage(root)
+	if err != nil {
+		return err
+	}
+	if f.maxWorkspaceBytes > 0 && used > f.maxWorkspaceBytes {
+		return fmt.Errorf("workspace storage quota exceeded (%d bytes)", f.maxWorkspaceBytes)
+	}
+	if isNew && f.maxWorkspaceFiles > 0 && count >= f.maxWorkspaceFiles {
+		return fmt.Errorf("workspace file count quota exceeded (%d files)", f.maxWorkspaceFiles)
+	}
+	return nil
+}
+
+func (f Files) usage(root string) (int64, int, error) {
+	var bytes int64
+	var count int
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+		bytes += info.Size()
+		count++
+		if f.maxWorkspaceBytes > 0 && bytes > f.maxWorkspaceBytes {
+			return errLimitReached
+		}
+		if f.maxWorkspaceFiles > 0 && count > f.maxWorkspaceFiles {
+			return errLimitReached
+		}
+		return nil
+	})
+	if errors.Is(err, errLimitReached) {
+		return bytes, count, nil
+	}
+	return bytes, count, err
 }
 
 func (f Files) Edit(tenant, path, oldText, newText string) error {
@@ -198,20 +300,21 @@ func (f Files) Delete(tenant, path string, confirm bool) error {
 	return os.Remove(target)
 }
 
-func (f Files) Search(tenant, pattern, query, path string) ([]string, error) {
+func (f Files) Search(tenant, pattern, query, path string, limit int) ([]string, bool, error) {
 	root, err := f.workspace.Root(tenant)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	target, err := resolve(root, path, false)
 	if err != nil {
-		return nil, friendlyPathError(err)
+		return nil, false, friendlyPathError(err)
 	}
 	info, err := os.Stat(target)
 	if err != nil {
-		return nil, friendlyPathError(err)
+		return nil, false, friendlyPathError(err)
 	}
 	var matches []string
+	truncated := false
 	visit := func(item string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -238,6 +341,10 @@ func (f Files) Search(tenant, pattern, query, path string) ([]string, error) {
 			}
 		}
 		matches = append(matches, filepath.ToSlash(rel))
+		if limit > 0 && len(matches) >= limit {
+			truncated = true
+			return errLimitReached
+		}
 		return nil
 	}
 	if info.IsDir() {
@@ -245,7 +352,10 @@ func (f Files) Search(tenant, pattern, query, path string) ([]string, error) {
 	} else {
 		err = visit(target, fileEntry{info}, nil)
 	}
-	return matches, err
+	if errors.Is(err, errLimitReached) {
+		err = nil
+	}
+	return matches, truncated, err
 }
 
 type fileEntry struct{ fs.FileInfo }

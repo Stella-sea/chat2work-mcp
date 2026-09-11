@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -183,6 +184,87 @@ func TestDownloadHandlerServesSignedFile(t *testing.T) {
 	app.DownloadHandler().ServeHTTP(badRecorder, bad)
 	if badRecorder.Code != http.StatusUnauthorized {
 		t.Fatalf("invalid signature status = %d", badRecorder.Code)
+	}
+}
+
+func TestAuditorRecordsStructuredEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditor, err := NewAuditor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{config: Config{StdioTenantID: "42"}, access: NewAccessManager(Config{}), audit: auditor}
+	handler := instrument(app, "fs_read", func(context.Context, *mcp.CallToolRequest, readInput) (*mcp.CallToolResult, any, error) {
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "boom"}}}, nil, nil
+	})
+	if _, _, err := handler(context.Background(), &mcp.CallToolRequest{}, readInput{Workspace: "user-42", Path: "a.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := auditor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event AuditEvent
+	if err := json.Unmarshal(bytes.TrimSpace(data), &event); err != nil {
+		t.Fatalf("audit line is not JSON: %v", err)
+	}
+	if event.Tool != "fs_read" || event.UserID != 42 || event.Outcome != "error" || event.Error != "boom" || event.Workspace != "user-42" || event.Path != "a.txt" {
+		t.Fatalf("unexpected audit event: %+v", event)
+	}
+}
+
+func TestWorkspaceQuotaEnforced(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byteQuota := Files{workspace: workspace, maxBytes: 1024, maxWorkspaceBytes: 10}
+	if err := byteQuota.Write("alice", "a.txt", "123456", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := byteQuota.Write("alice", "b.txt", "123456", false); err == nil {
+		t.Fatal("expected storage quota error")
+	}
+	countWorkspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileQuota := Files{workspace: countWorkspace, maxBytes: 1024, maxWorkspaceFiles: 2}
+	if err := fileQuota.Write("alice", "a.txt", "1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileQuota.Write("alice", "b.txt", "2", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileQuota.Write("alice", "c.txt", "3", false); err == nil {
+		t.Fatal("expected file count quota error")
+	}
+	if err := fileQuota.Write("alice", "a.txt", "1x", true); err != nil {
+		t.Fatalf("overwrite should bypass the new-file count check: %v", err)
+	}
+}
+
+func TestListAndSearchTruncate(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := Files{workspace: workspace, maxBytes: 1024}
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if err := files.Write("alice", name, "x", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, truncated, err := files.List("alice", ".", false, 2)
+	if err != nil || !truncated || len(items) != 2 {
+		t.Fatalf("List() = %v, truncated=%v, err=%v", items, truncated, err)
+	}
+	matches, truncated, err := files.Search("alice", "*.txt", "", ".", 1)
+	if err != nil || !truncated || len(matches) != 1 {
+		t.Fatalf("Search() = %v, truncated=%v, err=%v", matches, truncated, err)
 	}
 }
 
