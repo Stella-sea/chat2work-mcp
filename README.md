@@ -69,7 +69,9 @@ The service stays on `deeix-chat-network` and publishes only `127.0.0.1:8090` fo
 
 ## Configuration
 
-Every YAML setting may be overridden by its uppercase environment name: `LISTEN_ADDR`, `MCP_TOKEN`, `MCP_USER_CONTEXT_SECRET`, `WORKSPACE_ROOT`, `MAX_FILE_BYTES`, `MAX_WORKSPACE_BYTES`, `MAX_WORKSPACE_FILES`, `MAX_LIST_RESULTS`, `MAX_SEARCH_RESULTS`, `OFFICECLI_PATH`, `OFFICE_TIMEOUT`, `DELETE_ENABLED`, `AUDIT_LOG_PATH`, `DOWNLOAD_BASE_URL`, `DOWNLOAD_TTL`, `DOWNLOAD_SECRET`, and `STDIO_TENANT_ID`.
+Every YAML setting may be overridden by its uppercase environment name: `LISTEN_ADDR`, `MCP_TOKEN`, `MCP_USER_CONTEXT_SECRET`, `WORKSPACE_ROOT`, `MAX_FILE_BYTES`, `MAX_WORKSPACE_BYTES`, `MAX_WORKSPACE_FILES`, `MAX_LIST_RESULTS`, `MAX_SEARCH_RESULTS`, `OFFICECLI_PATH`, `OFFICE_TIMEOUT`, `MAX_OFFICE_CONCURRENCY`, `DELETE_ENABLED`, `AUDIT_LOG_PATH`, `DOWNLOAD_BASE_URL`, `DOWNLOAD_TTL`, `DOWNLOAD_SECRET`, and `STDIO_TENANT_ID`.
+
+`GET /healthz` is an unauthenticated liveness probe. `GET /readyz` returns 200 only when OfficeCLI is resolvable and the workspace root is writable, otherwise 503. Both are safe for container orchestration health checks.
 
 `fs_delete` defaults to disabled and never removes directories. `fs_write` uses a temporary file plus rename. `fs_edit` fails unless `old_text` appears exactly once.
 
@@ -77,7 +79,9 @@ Resource controls are enforced per workspace: `max_workspace_bytes` and `max_wor
 
 ## OfficeCLI: bundled, pinned, and multi-arch
 
-OfficeCLI is baked into the runtime image, not mounted. The Dockerfile downloads the matching release asset for the build target, verifies it against a pinned SHA256, and marks it executable. `OFFICECLI_SKIP_UPDATE=1` and `OFFICECLI_RESIDENT_FLUSH=each` are set on every invocation.
+OfficeCLI is baked into the runtime image, not mounted. The Dockerfile downloads the matching release asset for the build target, verifies it against a pinned SHA256, and marks it executable. `OFFICECLI_SKIP_UPDATE=1` and `OFFICECLI_NO_AUTO_RESIDENT=1` are set on every invocation.
+
+`create` auto-starts a background resident process by default, which would leak a process per document. `OFFICECLI_NO_AUTO_RESIDENT=1` disables that, so every call is a self-contained open/save/exit with no cross-request state. A `max_office_concurrency` semaphore (default 4) bounds how many OfficeCLI processes run at once.
 
 Two facts learned from the real binary matter for packaging:
 
@@ -107,12 +111,16 @@ Validated against `officecli-linux-alpine-x64` v1.0.149 inside `alpine:3.22` wit
 
 - `create <file>` infers document type from `.docx`, `.xlsx`, or `.pptx`; it has no `--kind` or `--content` parameter.
 - `batch <file> --commands <JSON-array>` is the supported bulk-edit invocation. `ops` supplied to the MCP is forwarded as that JSON array.
-- Successful `create` and `batch` calls may start a resident process. The server explicitly calls `close` after each, forcing a flush and preventing cross-request resident state.
+- With `OFFICECLI_NO_AUTO_RESIDENT=1`, `create`, `batch`, and `query` leave no background process; process count returns to zero after each call and the file is flushed on exit.
 - `create`/`close` succeeded for `.docx`, `.xlsx`, and `.pptx`; `--locale zh-CN` creation succeeded; DOCX `query --json` succeeded.
 - End-to-end through the built image: signed `fs_write`, `fs_list`, `doc_create`, `fs_link`, and a signed download all succeeded.
 - PDF conversion is unavailable without an OfficeCLI exporter plugin.
 
 Before enabling the Office tools in production, repeat and record these checks against the pinned binary: `create`/`batch --commands`/`close`/`query --json`, `OFFICECLI_SKIP_UPDATE=1`, DOCX/XLSX/PPTX smoke tests, large-XLSX resource measurements, and any PDF exporter plugins.
+
+## CI and releases
+
+`.github/workflows/ci.yml` runs `go vet`, `go test -race`, `go build`, and a Docker image build on every push and pull request. `.github/workflows/release.yml` builds and pushes a multi-arch (`linux/amd64`, `linux/arm64`) image to GHCR when a `v*` tag is pushed. OfficeCLI updates stay manual by design (see the version policy above); a scheduled workflow that opens a bump PR is a reasonable future addition.
 
 ## Development
 

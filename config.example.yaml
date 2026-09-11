@@ -10,6 +10,7 @@ max_search_results: 200
 # Bundled in the image at a pinned version; resolved from PATH by default.
 officecli_path: "officecli"
 office_timeout: "60s"
+max_office_concurrency: 4
 delete_enabled: false
 audit_log_path: "/data/audit/chat2work.jsonl"
 # Time-limited download links returned by fs_link. The browser cannot send the

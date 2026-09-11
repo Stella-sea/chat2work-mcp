@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -43,7 +44,7 @@ func New(config Config) (*App, error) {
 			maxWorkspaceFiles: config.MaxWorkspaceFiles,
 			deleteEnabled:     config.DeleteEnabled,
 		},
-		officeEngine: OfficeCLI{path: config.OfficeCLIPath},
+		officeEngine: NewOfficeCLI(config.OfficeCLIPath, config.MaxOfficeConcurrency),
 		downloads:    NewDownloadSigner(config.DownloadSecret, config.DownloadBaseURL, config.DownloadDuration()),
 		audit:        auditor,
 	}, nil
@@ -74,7 +75,27 @@ func (a *App) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/", requireBearer(a.config.MCPToken, mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return a.Server() }, &mcp.StreamableHTTPOptions{Stateless: true})))
 	mux.Handle("/download", a.DownloadHandler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", a.readyz)
 	return mux
+}
+
+// readyz reports whether the service can serve tool calls: OfficeCLI must be
+// resolvable and the workspace root must be writable.
+func (a *App) readyz(w http.ResponseWriter, _ *http.Request) {
+	if _, err := exec.LookPath(a.config.OfficeCLIPath); err != nil {
+		http.Error(w, "officecli not found", http.StatusServiceUnavailable)
+		return
+	}
+	if err := os.MkdirAll(a.config.WorkspaceRoot, 0o750); err != nil {
+		http.Error(w, "workspace root not writable", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
 }
 
 func (a *App) RunStdio(ctx context.Context) error {

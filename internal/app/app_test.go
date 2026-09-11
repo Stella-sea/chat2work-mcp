@@ -268,6 +268,31 @@ func TestListAndSearchTruncate(t *testing.T) {
 	}
 }
 
+func TestHealthAndReadinessEndpoints(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{config: Config{WorkspaceRoot: t.TempDir(), OfficeCLIPath: self}, access: NewAccessManager(Config{}), audit: &Auditor{}}
+	handler := app.HTTPHandler()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("healthz = %d", recorder.Code)
+	}
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("readyz = %d, want 200", recorder.Code)
+	}
+	app.config.OfficeCLIPath = "chat2work-definitely-missing-binary"
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz with missing officecli = %d, want 503", recorder.Code)
+	}
+}
+
 func TestDocumentToolsUseVerifiedOfficeCLIArguments(t *testing.T) {
 	workspace, err := NewWorkspace(t.TempDir())
 	if err != nil {

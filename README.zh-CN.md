@@ -69,7 +69,9 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 
 ## 配置项
 
-每个 YAML 配置都可用大写环境变量覆盖：`LISTEN_ADDR`、`MCP_TOKEN`、`MCP_USER_CONTEXT_SECRET`、`WORKSPACE_ROOT`、`MAX_FILE_BYTES`、`MAX_WORKSPACE_BYTES`、`MAX_WORKSPACE_FILES`、`MAX_LIST_RESULTS`、`MAX_SEARCH_RESULTS`、`OFFICECLI_PATH`、`OFFICE_TIMEOUT`、`DELETE_ENABLED`、`AUDIT_LOG_PATH`、`DOWNLOAD_BASE_URL`、`DOWNLOAD_TTL`、`DOWNLOAD_SECRET`、`STDIO_TENANT_ID`。
+每个 YAML 配置都可用大写环境变量覆盖：`LISTEN_ADDR`、`MCP_TOKEN`、`MCP_USER_CONTEXT_SECRET`、`WORKSPACE_ROOT`、`MAX_FILE_BYTES`、`MAX_WORKSPACE_BYTES`、`MAX_WORKSPACE_FILES`、`MAX_LIST_RESULTS`、`MAX_SEARCH_RESULTS`、`OFFICECLI_PATH`、`OFFICE_TIMEOUT`、`MAX_OFFICE_CONCURRENCY`、`DELETE_ENABLED`、`AUDIT_LOG_PATH`、`DOWNLOAD_BASE_URL`、`DOWNLOAD_TTL`、`DOWNLOAD_SECRET`、`STDIO_TENANT_ID`。
+
+`GET /healthz` 是无需鉴权的存活探针；`GET /readyz` 仅在 OfficeCLI 可解析且工作区根目录可写时返回 200，否则 503。两者都可用于容器编排的健康检查。
 
 `fs_delete` 默认禁用，且从不删除目录。`fs_write` 使用临时文件加 rename 原子写入。`fs_edit` 要求 `old_text` 精确匹配且唯一，否则报错。
 
@@ -77,7 +79,9 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 
 ## OfficeCLI：内置、固定版本、多架构
 
-OfficeCLI 内置在运行镜像中，不再挂载。Dockerfile 会按构建目标下载对应 release 资产、用固定 SHA256 校验、赋予可执行权限，并在每次调用时设置 `OFFICECLI_SKIP_UPDATE=1` 与 `OFFICECLI_RESIDENT_FLUSH=each`。
+OfficeCLI 内置在运行镜像中，不再挂载。Dockerfile 会按构建目标下载对应 release 资产、用固定 SHA256 校验、赋予可执行权限，并在每次调用时设置 `OFFICECLI_SKIP_UPDATE=1` 与 `OFFICECLI_NO_AUTO_RESIDENT=1`。
+
+`create` 默认会启动后台 resident 进程，等于每个文档泄漏一个进程。`OFFICECLI_NO_AUTO_RESIDENT=1` 关闭该行为，使每次调用都是自包含的 open/save/exit，无跨请求状态。`max_office_concurrency` 信号量（默认 4）限制同时运行的 OfficeCLI 进程数。
 
 实测二进制带来的两个打包要点：
 
@@ -107,12 +111,16 @@ docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/chat2work-m
 
 - `create <file>` 由 `.docx`、`.xlsx`、`.pptx` 后缀推断类型，没有 `--kind`、`--content` 参数。
 - `batch <file> --commands <JSON 数组>` 是受支持的批量编辑调用；MCP 的 `ops` 就作为该 JSON 数组转发。
-- 成功的 `create` 与 `batch` 可能启动 resident 进程。服务端在每次调用后显式 `close`，强制落盘并避免跨请求保留 resident 状态。
+- 设置 `OFFICECLI_NO_AUTO_RESIDENT=1` 后，`create`、`batch`、`query` 均不残留后台进程；每次调用后进程数归零，文件在退出时落盘。
 - `.docx`、`.xlsx`、`.pptx` 的 `create`/`close` 均成功；`--locale zh-CN` 创建成功；DOCX `query --json` 成功。
 - 通过构建出的镜像端到端验证：签名 `fs_write`、`fs_list`、`doc_create`、`fs_link` 与签名下载均成功。
 - 未安装 OfficeCLI 导出插件时无法转换 PDF。
 
 生产启用 Office 工具前，请针对固定版本的二进制重复并记录：`create`/`batch --commands`/`close`/`query --json`、`OFFICECLI_SKIP_UPDATE=1`、DOCX/XLSX/PPTX 冒烟测试、大 XLSX 资源占用，以及 PDF 导出插件情况。
+
+## CI 与发布
+
+`.github/workflows/ci.yml` 在每次 push 与 PR 时执行 `go vet`、`go test -race`、`go build` 与 Docker 镜像构建。`.github/workflows/release.yml` 在推送 `v*` tag 时构建并推送多架构（`linux/amd64`、`linux/arm64`）镜像到 GHCR。OfficeCLI 更新按设计保持手动（见上文版本策略）；后续可加一个定时工作流在出现新版本时自动开升级 PR。
 
 ## 开发
 

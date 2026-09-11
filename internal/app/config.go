@@ -22,6 +22,7 @@ type Config struct {
 	MaxSearchResults     int               `yaml:"max_search_results"`
 	OfficeCLIPath        string            `yaml:"officecli_path"`
 	OfficeTimeout        string            `yaml:"office_timeout"`
+	MaxOfficeConcurrency int               `yaml:"max_office_concurrency"`
 	DeleteEnabled        bool              `yaml:"delete_enabled"`
 	StdioTenantID        string            `yaml:"stdio_tenant_id"`
 	AuditLogPath         string            `yaml:"audit_log_path"`
@@ -79,6 +80,9 @@ func LoadConfig(path string) (Config, error) {
 	if c.OfficeTimeout == "" {
 		c.OfficeTimeout = "60s"
 	}
+	if c.MaxOfficeConcurrency <= 0 {
+		c.MaxOfficeConcurrency = 4
+	}
 	if _, err := time.ParseDuration(c.OfficeTimeout); err != nil {
 		return Config{}, fmt.Errorf("office_timeout: %w", err)
 	}
@@ -131,6 +135,11 @@ func applyEnv(c *Config) {
 	set("WORKSPACE_ROOT", &c.WorkspaceRoot)
 	set("OFFICECLI_PATH", &c.OfficeCLIPath)
 	set("OFFICE_TIMEOUT", &c.OfficeTimeout)
+	if v, ok := os.LookupEnv("MAX_OFFICE_CONCURRENCY"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.MaxOfficeConcurrency = n
+		}
+	}
 	set("STDIO_TENANT_ID", &c.StdioTenantID)
 	set("AUDIT_LOG_PATH", &c.AuditLogPath)
 	set("DOWNLOAD_BASE_URL", &c.DownloadBaseURL)
