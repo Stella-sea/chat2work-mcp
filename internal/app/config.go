@@ -26,6 +26,9 @@ type Config struct {
 	DeleteEnabled        bool              `yaml:"delete_enabled"`
 	StdioTenantID        string            `yaml:"stdio_tenant_id"`
 	AuditLogPath         string            `yaml:"audit_log_path"`
+	AuditMaxBytes        int64             `yaml:"audit_max_bytes"`
+	AuditMaxBackups      int               `yaml:"audit_max_backups"`
+	MaxUncompressedBytes int64             `yaml:"max_uncompressed_bytes"`
 	DownloadBaseURL      string            `yaml:"download_base_url"`
 	DownloadTTL          string            `yaml:"download_ttl"`
 	DownloadSecret       string            `yaml:"download_secret"`
@@ -82,6 +85,15 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if c.MaxOfficeConcurrency <= 0 {
 		c.MaxOfficeConcurrency = 4
+	}
+	if c.AuditMaxBytes <= 0 {
+		c.AuditMaxBytes = 50 << 20
+	}
+	if c.AuditMaxBackups <= 0 {
+		c.AuditMaxBackups = 5
+	}
+	if c.MaxUncompressedBytes <= 0 {
+		c.MaxUncompressedBytes = 256 << 20
 	}
 	if _, err := time.ParseDuration(c.OfficeTimeout); err != nil {
 		return Config{}, fmt.Errorf("office_timeout: %w", err)
@@ -142,6 +154,21 @@ func applyEnv(c *Config) {
 	}
 	set("STDIO_TENANT_ID", &c.StdioTenantID)
 	set("AUDIT_LOG_PATH", &c.AuditLogPath)
+	if v, ok := os.LookupEnv("AUDIT_MAX_BYTES"); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.AuditMaxBytes = n
+		}
+	}
+	if v, ok := os.LookupEnv("AUDIT_MAX_BACKUPS"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.AuditMaxBackups = n
+		}
+	}
+	if v, ok := os.LookupEnv("MAX_UNCOMPRESSED_BYTES"); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.MaxUncompressedBytes = n
+		}
+	}
 	set("DOWNLOAD_BASE_URL", &c.DownloadBaseURL)
 	set("DOWNLOAD_TTL", &c.DownloadTTL)
 	set("DOWNLOAD_SECRET", &c.DownloadSecret)

@@ -1,12 +1,14 @@
 package app
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,8 +24,17 @@ import (
 
 type recordingOffice struct{ calls [][]string }
 
-func (o *recordingOffice) Execute(_ context.Context, _ string, args []string) (string, error) {
+func (o *recordingOffice) Execute(_ context.Context, root string, args []string) (string, error) {
 	o.calls = append(o.calls, append([]string(nil), args...))
+	if len(args) >= 2 && args[0] == "create" {
+		path := filepath.Join(root, filepath.FromSlash(args[1]))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(path, []byte("fake document"), 0o640); err != nil {
+			return "", err
+		}
+	}
 	return "ok", nil
 }
 
@@ -189,7 +200,7 @@ func TestDownloadHandlerServesSignedFile(t *testing.T) {
 
 func TestAuditorRecordsStructuredEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditor, err := NewAuditor(path)
+	auditor, err := NewAuditor(path, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,6 +279,98 @@ func TestListAndSearchTruncate(t *testing.T) {
 	}
 }
 
+func TestAuditorRotates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditor, err := NewAuditor(path, 200, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		auditor.Record(AuditEvent{Tool: "fs_read", Path: "a/long/path/that/makes/the/record/larger.txt"})
+	}
+	if err := auditor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("current log missing: %v", err)
+	}
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("rotated backup missing: %v", err)
+	}
+	if _, err := os.Stat(path + ".3"); err == nil {
+		t.Fatal("rotation kept more backups than maxBackups")
+	}
+}
+
+func TestCheckOfficeInput(t *testing.T) {
+	dir := t.TempDir()
+	oversized := filepath.Join(dir, "big.bin")
+	if err := os.WriteFile(oversized, make([]byte, 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkOfficeInput(oversized, 50, 0); err == nil {
+		t.Fatal("expected size limit error")
+	}
+	bomb := filepath.Join(dir, "bomb.docx")
+	file, err := os.Create(bomb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := zip.NewWriter(file)
+	entry, err := writer.Create("word/document.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write(make([]byte, 10000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkOfficeInput(bomb, 1<<20, 5000); err == nil {
+		t.Fatal("expected uncompressed size limit error")
+	}
+}
+
+type failingBatchOffice struct{ calls [][]string }
+
+func (o *failingBatchOffice) Execute(_ context.Context, _ string, args []string) (string, error) {
+	o.calls = append(o.calls, append([]string(nil), args...))
+	return "", errors.New("boom")
+}
+
+func TestDocEditKeepsOriginalOnFailure(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := Files{workspace: workspace, maxBytes: 1 << 20}
+	if err := files.Write("user-42", "doc.docx", "original", false); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{config: Config{OfficeTimeout: "1s", StdioTenantID: "42", MaxUncompressedBytes: 1 << 20}, access: NewAccessManager(Config{}), files: files, officeEngine: &failingBatchOffice{}}
+	result, _, _ := app.docEdit(context.Background(), &mcp.CallToolRequest{}, docEditInput{Path: "doc.docx", Ops: json.RawMessage(`[{"command":"add"}]`)})
+	if result == nil || !result.IsError {
+		t.Fatalf("expected an error result, got %+v", result)
+	}
+	data, err := files.Read("user-42", "doc.docx", 0)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("original changed on failed edit: %q, %v", data, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(workspace.base, "user-42"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".chat2work-") {
+			t.Fatalf("temporary file left behind: %s", entry.Name())
+		}
+	}
+}
+
 func TestHealthAndReadinessEndpoints(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {
@@ -304,7 +407,13 @@ func TestDocumentToolsUseVerifiedOfficeCLIArguments(t *testing.T) {
 	if result, _, err := app.docCreate(context.Background(), req, docCreateInput{Path: "report.docx", Kind: "docx", Ops: json.RawMessage(`[{"command":"add"}]`)}); err != nil || result.IsError {
 		t.Fatalf("docCreate() = %+v, %v", result, err)
 	}
-	if len(office.calls) != 2 || strings.Join(office.calls[0], " ") != "create report.docx" || office.calls[1][0] != "batch" || office.calls[1][2] != "--commands" {
+	if len(office.calls) != 2 ||
+		office.calls[0][0] != "create" ||
+		!strings.HasPrefix(office.calls[0][1], "report.chat2work-") ||
+		!strings.HasSuffix(office.calls[0][1], ".docx") ||
+		office.calls[1][0] != "batch" ||
+		office.calls[1][1] != office.calls[0][1] ||
+		office.calls[1][2] != "--commands" {
 		t.Fatalf("unexpected office calls: %#v", office.calls)
 	}
 	if result, _, err := app.docCreate(context.Background(), req, docCreateInput{Path: "report.pdf"}); err != nil || !result.IsError {

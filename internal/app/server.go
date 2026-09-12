@@ -29,7 +29,7 @@ func New(config Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	auditor, err := NewAuditor(config.AuditLogPath)
+	auditor, err := NewAuditor(config.AuditLogPath, config.AuditMaxBytes, config.AuditMaxBackups)
 	if err != nil {
 		return nil, fmt.Errorf("open audit log: %w", err)
 	}
@@ -339,53 +339,68 @@ type docQueryInput struct {
 	Selector  string `json:"selector"`
 }
 
-func (a *App) runOffice(ctx context.Context, workspace string, args ...string) (*mcp.CallToolResult, any, error) {
+func (a *App) officeRun(ctx context.Context, workspace string, args ...string) (string, error) {
 	root, err := a.files.workspace.Root(workspace)
 	if err != nil {
-		return toolError(err)
+		return "", err
 	}
 	callCtx, cancel := context.WithTimeout(ctx, a.config.OfficeDuration())
 	defer cancel()
-	output, err := a.officeEngine.Execute(callCtx, root, args)
-	if err != nil {
-		return toolError(err)
-	}
-	return textResult(map[string]string{"output": output})
+	return a.officeEngine.Execute(callCtx, root, args)
 }
+
 func (a *App) docCreate(ctx context.Context, req *mcp.CallToolRequest, in docCreateInput) (*mcp.CallToolResult, any, error) {
 	grant, err := a.grant(req, in.Workspace, true, false)
-	if err != nil {
-		return toolError(err)
-	}
-	resolved, err := a.documentPath(grant.ID, in.Path, true)
 	if err != nil {
 		return toolError(err)
 	}
 	if err := validateDocumentPath(in.Path, in.Kind); err != nil {
 		return toolError(err)
 	}
+	hasOps := len(in.Ops) > 0 && string(in.Ops) != "null"
+	if hasOps && !isJSONArray(in.Ops) {
+		return toolError(fmt.Errorf("ops must be a JSON array"))
+	}
+	root, err := a.files.workspace.Root(grant.ID)
+	if err != nil {
+		return toolError(err)
+	}
+	final, err := resolve(root, in.Path, true)
+	if err != nil {
+		return toolError(friendlyPathError(err))
+	}
 	isNew := true
-	if _, statErr := os.Stat(resolved); statErr == nil {
+	if _, statErr := os.Stat(final); statErr == nil {
 		isNew = false
+	}
+	if !in.Overwrite && !isNew {
+		return toolError(fmt.Errorf("document already exists; set overwrite to replace it"))
 	}
 	if err := a.files.CheckWriteAllowed(grant.ID, isNew); err != nil {
 		return toolError(err)
 	}
-	if len(in.Ops) > 0 && string(in.Ops) != "null" && !isJSONArray(in.Ops) {
-		return toolError(fmt.Errorf("ops must be a JSON array"))
-	}
-	args := []string{"create", in.Path}
-	if in.Overwrite {
-		args = append(args, "--force")
-	}
+	cleanRel := filepath.ToSlash(filepath.Clean(in.Path))
+	tempRel := tempDocumentPath(cleanRel)
+	tempAbs := filepath.Join(root, filepath.FromSlash(tempRel))
 	lock := a.access.Lock(grant.ID)
 	lock.Lock()
 	defer lock.Unlock()
-	result, _, err := a.runOffice(ctx, grant.ID, args...)
-	if err != nil || len(in.Ops) == 0 || string(in.Ops) == "null" {
-		return result, nil, err
+	defer os.Remove(tempAbs)
+	if _, err := a.officeRun(ctx, grant.ID, "create", tempRel); err != nil {
+		return toolError(err)
 	}
-	return a.runOffice(ctx, grant.ID, "batch", in.Path, "--commands", string(in.Ops))
+	if hasOps {
+		if _, err := a.officeRun(ctx, grant.ID, "batch", tempRel, "--commands", string(in.Ops)); err != nil {
+			return toolError(err)
+		}
+	}
+	if err := checkOfficeInput(tempAbs, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
+		return toolError(err)
+	}
+	if err := os.Rename(tempAbs, final); err != nil {
+		return toolError(err)
+	}
+	return textResult(map[string]string{"status": "created", "path": cleanRel})
 }
 func (a *App) docEdit(ctx context.Context, req *mcp.CallToolRequest, in docEditInput) (*mcp.CallToolResult, any, error) {
 	grant, err := a.grant(req, in.Workspace, true, false)
@@ -395,13 +410,37 @@ func (a *App) docEdit(ctx context.Context, req *mcp.CallToolRequest, in docEditI
 	if !isJSONArray(in.Ops) {
 		return toolError(fmt.Errorf("ops must be a JSON array"))
 	}
-	if _, err := a.documentPath(grant.ID, in.Path, false); err != nil {
+	root, err := a.files.workspace.Root(grant.ID)
+	if err != nil {
 		return toolError(err)
 	}
+	final, err := resolve(root, in.Path, false)
+	if err != nil {
+		return toolError(friendlyPathError(err))
+	}
+	if err := checkOfficeInput(final, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
+		return toolError(err)
+	}
+	cleanRel := filepath.ToSlash(filepath.Clean(in.Path))
+	tempRel := tempDocumentPath(cleanRel)
+	tempAbs := filepath.Join(root, filepath.FromSlash(tempRel))
 	lock := a.access.Lock(grant.ID)
 	lock.Lock()
 	defer lock.Unlock()
-	return a.runOffice(ctx, grant.ID, "batch", in.Path, "--commands", string(in.Ops))
+	defer os.Remove(tempAbs)
+	if err := copyFile(final, tempAbs); err != nil {
+		return toolError(err)
+	}
+	if _, err := a.officeRun(ctx, grant.ID, "batch", tempRel, "--commands", string(in.Ops)); err != nil {
+		return toolError(err)
+	}
+	if err := checkOfficeInput(tempAbs, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
+		return toolError(err)
+	}
+	if err := os.Rename(tempAbs, final); err != nil {
+		return toolError(err)
+	}
+	return textResult(map[string]string{"status": "edited", "path": cleanRel})
 }
 
 func isJSONArray(raw json.RawMessage) bool {
@@ -424,13 +463,25 @@ func (a *App) docQuery(ctx context.Context, req *mcp.CallToolRequest, in docQuer
 	if err != nil {
 		return toolError(err)
 	}
-	if _, err := a.documentPath(grant.ID, in.Path, false); err != nil {
+	root, err := a.files.workspace.Root(grant.ID)
+	if err != nil {
+		return toolError(err)
+	}
+	final, err := resolve(root, in.Path, false)
+	if err != nil {
+		return toolError(friendlyPathError(err))
+	}
+	if err := checkOfficeInput(final, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
 		return toolError(err)
 	}
 	lock := a.access.Lock(grant.ID)
 	lock.RLock()
 	defer lock.RUnlock()
-	return a.runOffice(ctx, grant.ID, "query", in.Path, in.Selector, "--json")
+	output, err := a.officeRun(ctx, grant.ID, "query", filepath.ToSlash(filepath.Clean(in.Path)), in.Selector, "--json")
+	if err != nil {
+		return toolError(err)
+	}
+	return textResult(map[string]string{"output": output})
 }
 
 func (a *App) documentPath(tenant, path string, allowMissing bool) (string, error) {

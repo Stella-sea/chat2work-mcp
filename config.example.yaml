@@ -13,6 +13,10 @@ office_timeout: "60s"
 max_office_concurrency: 4
 delete_enabled: false
 audit_log_path: "/data/audit/chat2work.jsonl"
+audit_max_bytes: 52428800
+audit_max_backups: 5
+# Reject Office documents whose ZIP contents expand beyond this size.
+max_uncompressed_bytes: 268435456
 # Time-limited download links returned by fs_link. The browser cannot send the
 # static MCP bearer token, so the link carries its own HMAC signature.
 # download_base_url is the externally reachable prefix (through your reverse

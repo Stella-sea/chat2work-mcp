@@ -69,13 +69,15 @@ The service stays on `deeix-chat-network` and publishes only `127.0.0.1:8090` fo
 
 ## Configuration
 
-Every YAML setting may be overridden by its uppercase environment name: `LISTEN_ADDR`, `MCP_TOKEN`, `MCP_USER_CONTEXT_SECRET`, `WORKSPACE_ROOT`, `MAX_FILE_BYTES`, `MAX_WORKSPACE_BYTES`, `MAX_WORKSPACE_FILES`, `MAX_LIST_RESULTS`, `MAX_SEARCH_RESULTS`, `OFFICECLI_PATH`, `OFFICE_TIMEOUT`, `MAX_OFFICE_CONCURRENCY`, `DELETE_ENABLED`, `AUDIT_LOG_PATH`, `DOWNLOAD_BASE_URL`, `DOWNLOAD_TTL`, `DOWNLOAD_SECRET`, and `STDIO_TENANT_ID`.
+Every YAML setting may be overridden by its uppercase environment name: `LISTEN_ADDR`, `MCP_TOKEN`, `MCP_USER_CONTEXT_SECRET`, `WORKSPACE_ROOT`, `MAX_FILE_BYTES`, `MAX_WORKSPACE_BYTES`, `MAX_WORKSPACE_FILES`, `MAX_LIST_RESULTS`, `MAX_SEARCH_RESULTS`, `OFFICECLI_PATH`, `OFFICE_TIMEOUT`, `MAX_OFFICE_CONCURRENCY`, `MAX_UNCOMPRESSED_BYTES`, `DELETE_ENABLED`, `AUDIT_LOG_PATH`, `AUDIT_MAX_BYTES`, `AUDIT_MAX_BACKUPS`, `DOWNLOAD_BASE_URL`, `DOWNLOAD_TTL`, `DOWNLOAD_SECRET`, and `STDIO_TENANT_ID`.
 
 `GET /healthz` is an unauthenticated liveness probe. `GET /readyz` returns 200 only when OfficeCLI is resolvable and the workspace root is writable, otherwise 503. Both are safe for container orchestration health checks.
 
 `fs_delete` defaults to disabled and never removes directories. `fs_write` uses a temporary file plus rename. `fs_edit` fails unless `old_text` appears exactly once.
 
-Resource controls are enforced per workspace: `max_workspace_bytes` and `max_workspace_files` gate writes, and `max_list_results` / `max_search_results` bound `fs_list` and `fs_search` (the results include a `truncated` flag). When `audit_log_path` is set, every tool call appends one JSON Lines record (user, workspace, tool, path, outcome, duration, result size) with no file content or secrets.
+Resource controls are enforced per workspace: `max_workspace_bytes` and `max_workspace_files` gate writes, and `max_list_results` / `max_search_results` bound `fs_list` and `fs_search` (the results include a `truncated` flag). When `audit_log_path` is set, every tool call appends one JSON Lines record (user, workspace, tool, path, outcome, duration, result size) with no file content or secrets; the file rotates at `audit_max_bytes` and keeps `audit_max_backups` files.
+
+Office documents are size-checked against `max_file_bytes` and decompression-checked against `max_uncompressed_bytes` before they are handed to OfficeCLI. Mutating Office operations run against a temporary sibling file and are renamed over the target only on success, so a failed or timed-out edit leaves the original document untouched.
 
 ## OfficeCLI: bundled, pinned, and multi-arch
 

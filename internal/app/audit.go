@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -24,23 +25,43 @@ type AuditEvent struct {
 	ResultBytes int       `json:"result_bytes,omitempty"`
 }
 
-// Auditor appends JSON Lines audit records. A nil or disabled auditor is a
-// no-op so audit stays optional.
+// Auditor appends JSON Lines audit records with size-based rotation. A nil or
+// disabled auditor is a no-op so audit stays optional.
 type Auditor struct {
-	mu      sync.Mutex
-	file    *os.File
-	enabled bool
+	mu         sync.Mutex
+	file       *os.File
+	enabled    bool
+	path       string
+	size       int64
+	maxBytes   int64
+	maxBackups int
 }
 
-func NewAuditor(path string) (*Auditor, error) {
+func NewAuditor(path string, maxBytes int64, maxBackups int) (*Auditor, error) {
 	if path == "" {
 		return &Auditor{}, nil
 	}
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
-	if err != nil {
+	auditor := &Auditor{path: path, maxBytes: maxBytes, maxBackups: maxBackups}
+	if err := auditor.open(); err != nil {
 		return nil, err
 	}
-	return &Auditor{file: file, enabled: true}, nil
+	auditor.enabled = true
+	return auditor, nil
+}
+
+func (a *Auditor) open() error {
+	file, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	if err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	a.file = file
+	a.size = info.Size()
+	return nil
 }
 
 func (a *Auditor) Record(event AuditEvent) {
@@ -52,9 +73,35 @@ func (a *Auditor) Record(event AuditEvent) {
 	if err != nil {
 		return
 	}
+	data = append(data, '\n')
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	_, _ = a.file.Write(append(data, '\n'))
+	if a.maxBytes > 0 && a.size+int64(len(data)) > a.maxBytes {
+		a.rotate()
+	}
+	if a.file == nil {
+		return
+	}
+	written, _ := a.file.Write(data)
+	a.size += int64(written)
+}
+
+// rotate must be called with a.mu held.
+func (a *Auditor) rotate() {
+	_ = a.file.Close()
+	a.file = nil
+	if a.maxBackups > 0 {
+		_ = os.Remove(fmt.Sprintf("%s.%d", a.path, a.maxBackups))
+		for i := a.maxBackups - 1; i >= 1; i-- {
+			_ = os.Rename(fmt.Sprintf("%s.%d", a.path, i), fmt.Sprintf("%s.%d", a.path, i+1))
+		}
+		_ = os.Rename(a.path, a.path+".1")
+	} else {
+		_ = os.Remove(a.path)
+	}
+	if err := a.open(); err != nil {
+		a.enabled = false
+	}
 }
 
 func (a *Auditor) Close() error {

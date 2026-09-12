@@ -23,6 +23,23 @@ type Files struct {
 // leaves the package.
 var errLimitReached = errors.New("walk limit reached")
 
+func copyFile(src, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	target, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		_ = target.Close()
+		return err
+	}
+	return target.Close()
+}
+
 func (f Files) List(tenant, path string, recursive bool, limit int) ([]string, bool, error) {
 	root, err := f.workspace.Root(tenant)
 	if err != nil {
