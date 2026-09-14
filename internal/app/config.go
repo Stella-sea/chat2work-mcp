@@ -11,29 +11,31 @@ import (
 )
 
 type Config struct {
-	ListenAddr           string            `yaml:"listen_addr"`
-	LogLevel             string            `yaml:"log_level"`
-	MCPToken             string            `yaml:"mcp_token"`
-	MCPUserContextSecret string            `yaml:"mcp_user_context_secret"`
-	WorkspaceRoot        string            `yaml:"workspace_root"`
-	MaxFileBytes         int64             `yaml:"max_file_bytes"`
-	MaxWorkspaceBytes    int64             `yaml:"max_workspace_bytes"`
-	MaxWorkspaceFiles    int               `yaml:"max_workspace_files"`
-	MaxListResults       int               `yaml:"max_list_results"`
-	MaxSearchResults     int               `yaml:"max_search_results"`
-	OfficeCLIPath        string            `yaml:"officecli_path"`
-	OfficeTimeout        string            `yaml:"office_timeout"`
-	MaxOfficeConcurrency int               `yaml:"max_office_concurrency"`
-	DeleteEnabled        bool              `yaml:"delete_enabled"`
-	StdioTenantID        string            `yaml:"stdio_tenant_id"`
-	AuditLogPath         string            `yaml:"audit_log_path"`
-	AuditMaxBytes        int64             `yaml:"audit_max_bytes"`
-	AuditMaxBackups      int               `yaml:"audit_max_backups"`
-	MaxUncompressedBytes int64             `yaml:"max_uncompressed_bytes"`
-	DownloadBaseURL      string            `yaml:"download_base_url"`
-	DownloadTTL          string            `yaml:"download_ttl"`
-	DownloadSecret       string            `yaml:"download_secret"`
-	Workspaces           []WorkspaceConfig `yaml:"workspaces"`
+	ListenAddr            string            `yaml:"listen_addr"`
+	LogLevel              string            `yaml:"log_level"`
+	MCPToken              string            `yaml:"mcp_token"`
+	MCPUserContextSecret  string            `yaml:"mcp_user_context_secret"`
+	WorkspaceRoot         string            `yaml:"workspace_root"`
+	MaxFileBytes          int64             `yaml:"max_file_bytes"`
+	MaxWorkspaceBytes     int64             `yaml:"max_workspace_bytes"`
+	MaxWorkspaceFiles     int               `yaml:"max_workspace_files"`
+	MaxListResults        int               `yaml:"max_list_results"`
+	MaxSearchResults      int               `yaml:"max_search_results"`
+	OfficeCLIPath         string            `yaml:"officecli_path"`
+	OfficeTimeout         string            `yaml:"office_timeout"`
+	MaxOfficeConcurrency  int               `yaml:"max_office_concurrency"`
+	DeleteEnabled         bool              `yaml:"delete_enabled"`
+	StdioTenantID         string            `yaml:"stdio_tenant_id"`
+	AuditLogPath          string            `yaml:"audit_log_path"`
+	AuditMaxBytes         int64             `yaml:"audit_max_bytes"`
+	AuditMaxBackups       int               `yaml:"audit_max_backups"`
+	MaxUncompressedBytes  int64             `yaml:"max_uncompressed_bytes"`
+	DownloadBaseURL       string            `yaml:"download_base_url"`
+	DownloadTTL           string            `yaml:"download_ttl"`
+	DownloadSecret        string            `yaml:"download_secret"`
+	RequestIDCacheTTL     string            `yaml:"request_id_cache_ttl"`
+	RequestIDCacheEntries int               `yaml:"request_id_cache_entries"`
+	Workspaces            []WorkspaceConfig `yaml:"workspaces"`
 }
 
 type WorkspaceConfig struct {
@@ -108,6 +110,19 @@ func LoadConfig(path string) (Config, error) {
 	if _, err := time.ParseDuration(c.DownloadTTL); err != nil {
 		return Config{}, fmt.Errorf("download_ttl: %w", err)
 	}
+	if c.RequestIDCacheTTL == "" {
+		c.RequestIDCacheTTL = "10m"
+	}
+	requestIDCacheTTL, err := time.ParseDuration(c.RequestIDCacheTTL)
+	if err != nil {
+		return Config{}, fmt.Errorf("request_id_cache_ttl: %w", err)
+	}
+	if requestIDCacheTTL <= 0 {
+		c.RequestIDCacheTTL = "10m"
+	}
+	if c.RequestIDCacheEntries <= 0 {
+		c.RequestIDCacheEntries = 1000
+	}
 	if strings.TrimSpace(c.DownloadSecret) == "" {
 		c.DownloadSecret = c.MCPUserContextSecret
 	}
@@ -138,6 +153,11 @@ func LoadConfig(path string) (Config, error) {
 func (c Config) OfficeDuration() time.Duration { d, _ := time.ParseDuration(c.OfficeTimeout); return d }
 
 func (c Config) DownloadDuration() time.Duration { d, _ := time.ParseDuration(c.DownloadTTL); return d }
+
+func (c Config) RequestIDCacheDuration() time.Duration {
+	d, _ := time.ParseDuration(c.RequestIDCacheTTL)
+	return d
+}
 
 func applyEnv(c *Config) {
 	set := func(key string, target *string) {
@@ -177,6 +197,12 @@ func applyEnv(c *Config) {
 	set("DOWNLOAD_BASE_URL", &c.DownloadBaseURL)
 	set("DOWNLOAD_TTL", &c.DownloadTTL)
 	set("DOWNLOAD_SECRET", &c.DownloadSecret)
+	set("REQUEST_ID_CACHE_TTL", &c.RequestIDCacheTTL)
+	if v, ok := os.LookupEnv("REQUEST_ID_CACHE_ENTRIES"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.RequestIDCacheEntries = n
+		}
+	}
 	if v, ok := os.LookupEnv("MAX_FILE_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxFileBytes = n

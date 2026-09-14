@@ -24,6 +24,7 @@ type App struct {
 	downloads    DownloadSigner
 	audit        *Auditor
 	logger       *slog.Logger
+	requestIDs   *requestIDCache
 }
 
 func New(config Config) (*App, error) {
@@ -52,6 +53,7 @@ func New(config Config) (*App, error) {
 		downloads:    NewDownloadSigner(config.DownloadSecret, config.DownloadBaseURL, config.DownloadDuration()),
 		audit:        auditor,
 		logger:       logger,
+		requestIDs:   newRequestIDCache(config.RequestIDCacheDuration(), config.RequestIDCacheEntries),
 	}, nil
 }
 

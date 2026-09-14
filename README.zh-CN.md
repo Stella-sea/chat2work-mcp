@@ -69,7 +69,7 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 
 ## 配置项
 
-每个 YAML 配置都可用大写环境变量覆盖：`LISTEN_ADDR`、`LOG_LEVEL`、`MCP_TOKEN`、`MCP_USER_CONTEXT_SECRET`、`WORKSPACE_ROOT`、`MAX_FILE_BYTES`、`MAX_WORKSPACE_BYTES`、`MAX_WORKSPACE_FILES`、`MAX_LIST_RESULTS`、`MAX_SEARCH_RESULTS`、`OFFICECLI_PATH`、`OFFICE_TIMEOUT`、`MAX_OFFICE_CONCURRENCY`、`MAX_UNCOMPRESSED_BYTES`、`DELETE_ENABLED`、`AUDIT_LOG_PATH`、`AUDIT_MAX_BYTES`、`AUDIT_MAX_BACKUPS`、`DOWNLOAD_BASE_URL`、`DOWNLOAD_TTL`、`DOWNLOAD_SECRET`、`STDIO_TENANT_ID`。
+每个 YAML 配置都可用大写环境变量覆盖：`LISTEN_ADDR`、`LOG_LEVEL`、`MCP_TOKEN`、`MCP_USER_CONTEXT_SECRET`、`WORKSPACE_ROOT`、`MAX_FILE_BYTES`、`MAX_WORKSPACE_BYTES`、`MAX_WORKSPACE_FILES`、`MAX_LIST_RESULTS`、`MAX_SEARCH_RESULTS`、`OFFICECLI_PATH`、`OFFICE_TIMEOUT`、`MAX_OFFICE_CONCURRENCY`、`MAX_UNCOMPRESSED_BYTES`、`DELETE_ENABLED`、`AUDIT_LOG_PATH`、`AUDIT_MAX_BYTES`、`AUDIT_MAX_BACKUPS`、`DOWNLOAD_BASE_URL`、`DOWNLOAD_TTL`、`DOWNLOAD_SECRET`、`REQUEST_ID_CACHE_TTL`、`REQUEST_ID_CACHE_ENTRIES`、`STDIO_TENANT_ID`。
 
 `GET /healthz` 是无需鉴权的存活探针；`GET /readyz` 仅在 OfficeCLI 可解析且工作区根目录可写时返回 200，否则 503。两者都可用于容器编排的健康检查。
 
@@ -78,6 +78,8 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 资源控制按工作区生效：`max_workspace_bytes` 与 `max_workspace_files` 约束写入，`max_list_results` 与 `max_search_results` 约束 `fs_list` 和 `fs_search`（结果含 `truncated` 标记）。设置 `audit_log_path` 后，每次工具调用追加一条 JSON Lines 记录（用户、工作区、工具、路径、结果、耗时、结果大小），不含文件内容或密钥；日志在 `audit_max_bytes` 时轮转，保留 `audit_max_backups` 个文件。
 
 日志为 stderr 上的结构化 JSON（stdout 保留给 stdio 传输），由 `log_level` 控制。每个 HTTP 请求与工具调用都会带上 `request_id`：优先取 `X-Request-Id` 头或 DEEIX 签名上下文中的 `request_id`，否则自动生成。日志不含文件内容、token 或签名上下文。
+
+当 DEEIX 的签名上下文带有 `request_id` 时，重试同一个修改操作是安全的。对于 `fs_write`、`fs_edit`、`fs_move`、`fs_delete`、`doc_create`、`doc_edit`，服务按已认证用户、请求 ID、工具名和规范化参数去重。已完成的 MCP 结果会按 `request_id_cache_ttl`（默认 `10m`）缓存，并受 `request_id_cache_entries`（默认 `1000`）限制。读取操作绝不缓存；没有签名 request_id 的调用保持原行为；审计和日志会以 `deduplicated: true` 标记重放调用。
 
 Office 文档在交给 OfficeCLI 前会做大小检查（`max_file_bytes`）与解压膨胀检查（`max_uncompressed_bytes`）。会修改文档的 Office 操作先作用于同目录临时文件，仅在成功后重命名覆盖目标，因此失败或超时的编辑不会破坏原文档。
 

@@ -15,16 +15,17 @@ import (
 // AuditEvent is one structured tool-call record. It never contains file
 // content or secrets.
 type AuditEvent struct {
-	Time        time.Time `json:"time"`
-	RequestID   string    `json:"request_id,omitempty"`
-	UserID      uint64    `json:"user_id,omitempty"`
-	Workspace   string    `json:"workspace,omitempty"`
-	Tool        string    `json:"tool"`
-	Path        string    `json:"path,omitempty"`
-	Outcome     string    `json:"outcome"`
-	Error       string    `json:"error,omitempty"`
-	DurationMS  int64     `json:"duration_ms"`
-	ResultBytes int       `json:"result_bytes,omitempty"`
+	Time         time.Time `json:"time"`
+	RequestID    string    `json:"request_id,omitempty"`
+	UserID       uint64    `json:"user_id,omitempty"`
+	Workspace    string    `json:"workspace,omitempty"`
+	Tool         string    `json:"tool"`
+	Path         string    `json:"path,omitempty"`
+	Outcome      string    `json:"outcome"`
+	Error        string    `json:"error,omitempty"`
+	DurationMS   int64     `json:"duration_ms"`
+	ResultBytes  int       `json:"result_bytes,omitempty"`
+	Deduplicated bool      `json:"deduplicated,omitempty"`
 }
 
 // Auditor appends JSON Lines audit records with size-based rotation. A nil or
@@ -133,8 +134,11 @@ func (in docQueryInput) auditTarget() (string, string)  { return in.Workspace, i
 func instrument[In any](a *App, name string, h func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, any, error)) func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, any, error) {
 	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
 		start := time.Now()
-		result, out, err := h(ctx, req, in)
+		result, out, err, deduplicated := deduplicate(a, name, req, in, func() (*mcp.CallToolResult, any, error) {
+			return h(ctx, req, in)
+		})
 		event := AuditEvent{Tool: name, Outcome: "ok", DurationMS: time.Since(start).Milliseconds()}
+		event.Deduplicated = deduplicated
 		requestID := requestIDFrom(ctx)
 		if identity, idErr := a.identity(req); idErr == nil {
 			event.UserID = identity.UserID
@@ -172,8 +176,36 @@ func instrument[In any](a *App, name string, h func(context.Context, *mcp.CallTo
 			slog.Int64("duration_ms", event.DurationMS),
 			slog.Int("result_bytes", event.ResultBytes),
 			slog.String("error", event.Error),
+			slog.Bool("deduplicated", deduplicated),
 		)
 		return result, out, err
+	}
+}
+
+func deduplicate[In any](a *App, name string, req *mcp.CallToolRequest, in In, h func() (*mcp.CallToolResult, any, error)) (*mcp.CallToolResult, any, error, bool) {
+	if a.requestIDs == nil || !mutatingTool(name) {
+		result, out, err := h()
+		return result, out, err, false
+	}
+	identity, err := a.identity(req)
+	if err != nil || identity.RequestID == "" {
+		result, out, callErr := h()
+		return result, out, callErr, false
+	}
+	key, err := idempotencyKey(identity.UserID, identity.RequestID, name, in)
+	if err != nil {
+		result, out, callErr := h()
+		return result, out, callErr, false
+	}
+	return a.requestIDs.call(key, h)
+}
+
+func mutatingTool(name string) bool {
+	switch name {
+	case "fs_write", "fs_edit", "fs_move", "fs_delete", "doc_create", "doc_edit":
+		return true
+	default:
+		return false
 	}
 }
 

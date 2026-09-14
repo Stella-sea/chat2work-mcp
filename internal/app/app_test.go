@@ -17,6 +17,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -466,6 +468,189 @@ func TestToolCallLoggingIncludesRequestID(t *testing.T) {
 	if !strings.Contains(output, `"request_id":"req-xyz"`) || !strings.Contains(output, "tool_call") {
 		t.Fatalf("expected tool_call log with request id, got: %s", output)
 	}
+}
+
+func TestInstrumentDeduplicatesMutatingCalls(t *testing.T) {
+	app := idempotencyTestApp()
+	var calls atomic.Int32
+	handler := instrument(app, "fs_write", func(_ context.Context, _ *mcp.CallToolRequest, in writeInput) (*mcp.CallToolResult, any, error) {
+		calls.Add(1)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: in.Content}}}, nil, nil
+	})
+	req := idempotencyRequest(t, 42, "request-1")
+	first, _, err := handler(context.Background(), req, writeInput{Path: "a.txt", Content: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Content[0].(*mcp.TextContent).Text = "changed"
+	second, _, err := handler(context.Background(), req, writeInput{Path: "a.txt", Content: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || firstText(second) != "first" {
+		t.Fatalf("calls=%d, second=%+v", calls.Load(), second)
+	}
+}
+
+func TestInstrumentSeparatesRequestIDByParametersAndUser(t *testing.T) {
+	app := idempotencyTestApp()
+	var calls atomic.Int32
+	handler := instrument(app, "fs_write", func(context.Context, *mcp.CallToolRequest, writeInput) (*mcp.CallToolResult, any, error) {
+		calls.Add(1)
+		return &mcp.CallToolResult{}, nil, nil
+	})
+	if _, _, err := handler(context.Background(), idempotencyRequest(t, 42, "request-1"), writeInput{Path: "a.txt", Content: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := handler(context.Background(), idempotencyRequest(t, 42, "request-1"), writeInput{Path: "a.txt", Content: "two"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := handler(context.Background(), idempotencyRequest(t, 73, "request-1"), writeInput{Path: "a.txt", Content: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("calls=%d, want 3", calls.Load())
+	}
+}
+
+func TestInstrumentDeduplicatesConcurrentCalls(t *testing.T) {
+	app := idempotencyTestApp()
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := instrument(app, "fs_write", func(context.Context, *mcp.CallToolRequest, writeInput) (*mcp.CallToolResult, any, error) {
+		calls.Add(1)
+		close(started)
+		<-release
+		return &mcp.CallToolResult{}, nil, nil
+	})
+	req := idempotencyRequest(t, 42, "request-1")
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			if _, _, err := handler(context.Background(), req, writeInput{Path: "a.txt", Content: "one"}); err != nil {
+				t.Errorf("handler: %v", err)
+			}
+		}()
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("calls=%d, want 1", calls.Load())
+	}
+}
+
+func TestRequestIDCacheBypassesWhenAllEntriesAreInFlight(t *testing.T) {
+	cache := newRequestIDCache(time.Minute, 1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var aWG sync.WaitGroup
+	aWG.Add(1)
+	go func() {
+		defer aWG.Done()
+		_, _, _, _ = cache.call("A", func() (*mcp.CallToolResult, any, error) {
+			close(started)
+			<-release
+			return &mcp.CallToolResult{}, nil, nil
+		})
+	}()
+	<-started
+
+	var bCalls atomic.Int32
+	b := func() (*mcp.CallToolResult, any, error) {
+		bCalls.Add(1)
+		return &mcp.CallToolResult{}, nil, nil
+	}
+	if _, _, err, deduplicated := cache.call("B", b); err != nil || deduplicated {
+		t.Fatalf("first B call: err=%v, deduplicated=%v", err, deduplicated)
+	}
+	cache.mu.Lock()
+	entries := len(cache.entries)
+	cache.mu.Unlock()
+	if entries > 1 {
+		t.Fatalf("cache entries=%d, want at most 1", entries)
+	}
+
+	close(release)
+	aWG.Wait()
+	if _, _, err, deduplicated := cache.call("B", b); err != nil || deduplicated {
+		t.Fatalf("second B call: err=%v, deduplicated=%v", err, deduplicated)
+	}
+	if bCalls.Load() != 2 {
+		t.Fatalf("B calls=%d, want 2", bCalls.Load())
+	}
+}
+
+func TestInstrumentDoesNotDeduplicateWithoutSignedRequestID(t *testing.T) {
+	app := idempotencyTestApp()
+	var calls atomic.Int32
+	handler := instrument(app, "fs_write", func(context.Context, *mcp.CallToolRequest, writeInput) (*mcp.CallToolResult, any, error) {
+		calls.Add(1)
+		return &mcp.CallToolResult{}, nil, nil
+	})
+	for range 2 {
+		if _, _, err := handler(context.Background(), idempotencyRequest(t, 42, ""), writeInput{Path: "a.txt", Content: "one"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d, want 2", calls.Load())
+	}
+}
+
+func TestInstrumentReplaysMCPErrorButNotGoError(t *testing.T) {
+	app := idempotencyTestApp()
+	var resultCalls, errorCalls int
+	resultHandler := instrument(app, "fs_write", func(context.Context, *mcp.CallToolRequest, writeInput) (*mcp.CallToolResult, any, error) {
+		resultCalls++
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "tool failure"}}}, nil, nil
+	})
+	errorHandler := instrument(app, "fs_edit", func(context.Context, *mcp.CallToolRequest, editInput) (*mcp.CallToolResult, any, error) {
+		errorCalls++
+		return nil, nil, errors.New("transport failure")
+	})
+	req := idempotencyRequest(t, 42, "request-1")
+	for range 2 {
+		result, _, err := resultHandler(context.Background(), req, writeInput{Path: "a.txt", Content: "one"})
+		if err != nil || result == nil || !result.IsError || firstText(result) != "tool failure" {
+			t.Fatalf("result=%+v, err=%v", result, err)
+		}
+	}
+	for range 2 {
+		if _, _, err := errorHandler(context.Background(), req, editInput{Path: "a.txt", OldText: "a", NewText: "b"}); err == nil {
+			t.Fatal("expected Go error")
+		}
+	}
+	if resultCalls != 1 || errorCalls != 2 {
+		t.Fatalf("result calls=%d, error calls=%d", resultCalls, errorCalls)
+	}
+}
+
+func idempotencyTestApp() *App {
+	return &App{
+		config:     Config{MCPUserContextSecret: "secret"},
+		resolver:   DeeixResolver{Secret: "secret"},
+		audit:      &Auditor{},
+		logger:     slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		requestIDs: newRequestIDCache(time.Minute, 100),
+	}
+}
+
+func idempotencyRequest(t *testing.T, userID uint64, requestID string) *mcp.CallToolRequest {
+	t.Helper()
+	payload, err := json.Marshal(userContext{UserID: userID, RequestID: requestID, ExpiresAt: time.Now().Add(time.Minute).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	_, _ = mac.Write([]byte(encoded))
+	headers := make(http.Header)
+	headers.Set(userContextHeader, "v1."+encoded+"."+base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))
+	return &mcp.CallToolRequest{Extra: &mcp.RequestExtra{Header: headers}}
 }
 
 func TestHealthAndReadinessEndpoints(t *testing.T) {

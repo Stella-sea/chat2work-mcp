@@ -27,6 +27,10 @@ download_base_url: "https://your-domain.example/chat2work"
 download_ttl: "15m"
 # Defaults to mcp_user_context_secret when omitted.
 # download_secret: "replace-with-a-dedicated-random-secret"
+# Deduplicate retried mutating calls that carry a signed DEEIX request_id.
+# Zero or negative values use the defaults (10m and 1000 entries).
+request_id_cache_ttl: "10m"
+request_id_cache_entries: 1000
 # Users not listed below receive only their private workspace, whose directory
 # is named after their signed DEEIX user_id. Add shared workspaces explicitly.
 # workspaces:
