@@ -5,7 +5,7 @@
 ## Scope
 
 - Workspace file tools: `fs_list`, `fs_read`, `fs_write`, `fs_edit`, `fs_move`, `fs_delete`, `fs_search`, and `fs_link`.
-- OfficeCLI-backed tools: `doc_create`, `doc_edit`, and `doc_query`.
+- OfficeCLI-backed tools: `doc_create`, `doc_edit`, `doc_query`, and `sheet_set_cells`.
 - `workspace_list` to discover the workspaces assigned to the caller.
 - Streamable HTTP for DEEIX and stdio for explicit local debugging.
 - No shell execution, sandbox, RAG, web search, skill hosting, or plugin marketplace.
@@ -79,7 +79,7 @@ Resource controls are enforced per workspace: `max_workspace_bytes` and `max_wor
 
 Logs are structured JSON on stderr (stdout stays reserved for the stdio transport), controlled by `log_level`. Each HTTP request and tool call is logged with a `request_id`, taken from the `X-Request-Id` header or the DEEIX signed context when present, and generated otherwise. Logs never contain file contents, tokens, or signed contexts.
 
-DEEIX retries can safely repeat a mutating call when its signed context includes a `request_id`. For `fs_write`, `fs_edit`, `fs_move`, `fs_delete`, `doc_create`, and `doc_edit`, the service deduplicates calls by authenticated user, request id, tool, and normalized parameters. It caches completed MCP results for `request_id_cache_ttl` (default `10m`) and bounds the cache to `request_id_cache_entries` (default `1000`). Reads are never cached, calls without a signed request id run normally, and audit/log records mark replays with `deduplicated: true`.
+DEEIX retries can safely repeat a mutating call when its signed context includes a `request_id`. For `fs_write`, `fs_edit`, `fs_move`, `fs_delete`, `doc_create`, `doc_edit`, and `sheet_set_cells`, the service deduplicates calls by authenticated user, request id, tool, and normalized parameters. It caches completed MCP results for `request_id_cache_ttl` (default `10m`) and bounds the cache to `request_id_cache_entries` (default `1000`). Reads are never cached, calls without a signed request id run normally, and audit/log records mark replays with `deduplicated: true`.
 
 Office documents are size-checked against `max_file_bytes` and decompression-checked against `max_uncompressed_bytes` before they are handed to OfficeCLI. Mutating Office operations run against a temporary sibling file and are renamed over the target only on success, so a failed or timed-out edit leaves the original document untouched.
 
@@ -88,6 +88,8 @@ Office documents are size-checked against `max_file_bytes` and decompression-che
 OfficeCLI is baked into the runtime image, not mounted. The Dockerfile downloads the matching release asset for the build target, verifies it against a pinned SHA256, and marks it executable. `OFFICECLI_SKIP_UPDATE=1` and `OFFICECLI_NO_AUTO_RESIDENT=1` are set on every invocation.
 
 `create` auto-starts a background resident process by default, which would leak a process per document. `OFFICECLI_NO_AUTO_RESIDENT=1` disables that, so every call is a self-contained open/save/exit with no cross-request state. A `max_office_concurrency` semaphore (default 4) bounds how many OfficeCLI processes run at once.
+
+`sheet_set_cells` converts a same-worksheet batch of up to 1000 A1 cells into OfficeCLI `set` commands. A `value` beginning with `=` is an Excel formula; optional `props` apply limited OfficeCLI cell formatting. It never spans worksheets or workbooks.
 
 Two facts learned from the real binary matter for packaging:
 

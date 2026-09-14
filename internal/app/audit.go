@@ -129,6 +129,9 @@ func (in linkInput) auditTarget() (string, string)      { return in.Workspace, i
 func (in docCreateInput) auditTarget() (string, string) { return in.Workspace, in.Path }
 func (in docEditInput) auditTarget() (string, string)   { return in.Workspace, in.Path }
 func (in docQueryInput) auditTarget() (string, string)  { return in.Workspace, in.Path }
+func (in sheetSetCellsInput) auditTarget() (string, string) {
+	return in.Workspace, in.Path
+}
 
 // instrument wraps a tool handler with audit recording.
 func instrument[In any](a *App, name string, h func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, any, error)) func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, any, error) {
@@ -202,7 +205,7 @@ func deduplicate[In any](a *App, name string, req *mcp.CallToolRequest, in In, h
 
 func mutatingTool(name string) bool {
 	switch name {
-	case "fs_write", "fs_edit", "fs_move", "fs_delete", "doc_create", "doc_edit":
+	case "fs_write", "fs_edit", "fs_move", "fs_delete", "doc_create", "doc_edit", "sheet_set_cells":
 		return true
 	default:
 		return false

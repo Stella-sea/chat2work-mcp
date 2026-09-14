@@ -374,6 +374,126 @@ func TestDocEditKeepsOriginalOnFailure(t *testing.T) {
 	}
 }
 
+func TestSheetSetCellsBuildsBatchCommands(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := Files{workspace: workspace, maxBytes: 1 << 20}
+	if err := files.Write("user-42", "report.xlsx", "original", false); err != nil {
+		t.Fatal(err)
+	}
+	office := &recordingOffice{}
+	app := &App{config: Config{OfficeTimeout: "1s", StdioTenantID: "42", MaxUncompressedBytes: 1 << 20}, access: NewAccessManager(Config{}), files: files, officeEngine: office}
+	value := "=SUM(A2:A3)"
+	result, _, err := app.sheetSetCells(context.Background(), &mcp.CallToolRequest{}, sheetSetCellsInput{
+		Path:  "report.xlsx",
+		Sheet: "Sheet1",
+		Cells: []sheetSetCell{{Address: "$a$1", Value: &value, Props: map[string]string{"bold": "true", "fill": "FFF2CC"}}},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("sheetSetCells() = %+v, %v", result, err)
+	}
+	if len(office.calls) != 1 || office.calls[0][0] != "batch" || !strings.HasPrefix(office.calls[0][1], "report.chat2work-") || !strings.HasSuffix(office.calls[0][1], ".xlsx") || office.calls[0][2] != "--commands" {
+		t.Fatalf("unexpected office calls: %#v", office.calls)
+	}
+	var commands []struct {
+		Command string            `json:"command"`
+		Path    string            `json:"path"`
+		Props   map[string]string `json:"props"`
+	}
+	if err := json.Unmarshal([]byte(office.calls[0][3]), &commands); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 || commands[0].Command != "set" || commands[0].Path != "/Sheet1/A1" || commands[0].Props["value"] != value || commands[0].Props["bold"] != "true" || commands[0].Props["fill"] != "FFF2CC" {
+		t.Fatalf("commands = %#v", commands)
+	}
+	if firstText(result) == "" || !strings.Contains(firstText(result), `"cells": 1`) {
+		t.Fatalf("result = %s", firstText(result))
+	}
+}
+
+func TestSheetSetCellsRejectsInvalidInput(t *testing.T) {
+	valid := []sheetSetCell{{Address: "A1", Value: stringPointer("x")}}
+	tests := []struct {
+		name  string
+		sheet string
+		cells []sheetSetCell
+	}{
+		{"empty cells", "Sheet1", nil},
+		{"range", "Sheet1", []sheetSetCell{{Address: "A1:B2", Value: stringPointer("x")}}},
+		{"column beyond XFD", "Sheet1", []sheetSetCell{{Address: "XFE1", Value: stringPointer("x")}}},
+		{"zero row", "Sheet1", []sheetSetCell{{Address: "A0", Value: stringPointer("x")}}},
+		{"row beyond maximum", "Sheet1", []sheetSetCell{{Address: "A1048577", Value: stringPointer("x")}}},
+		{"duplicate normalized address", "Sheet1", []sheetSetCell{{Address: "A1", Value: stringPointer("x")}, {Address: "$a$1", Value: stringPointer("y")}}},
+		{"empty cell change", "Sheet1", []sheetSetCell{{Address: "A1"}}},
+		{"props value conflict", "Sheet1", []sheetSetCell{{Address: "A1", Props: map[string]string{"value": "x"}}}},
+		{"props Value conflict", "Sheet1", []sheetSetCell{{Address: "A1", Props: map[string]string{"Value": "x"}}}},
+		{"empty sheet", "", valid},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := sheetSetCellCommands(test.sheet, test.cells); err == nil {
+				t.Fatal("sheetSetCellCommands accepted invalid input")
+			}
+		})
+	}
+	for _, character := range []string{"/", "\\", ":", "*", "?", "[", "]", "\x00"} {
+		t.Run("invalid sheet character "+character, func(t *testing.T) {
+			if _, err := sheetSetCellCommands("Sheet"+character+"1", valid); err == nil {
+				t.Fatalf("sheet name accepted invalid character %q", character)
+			}
+		})
+	}
+	app := &App{config: Config{StdioTenantID: "42"}, access: NewAccessManager(Config{})}
+	result, _, _ := app.sheetSetCells(context.Background(), &mcp.CallToolRequest{}, sheetSetCellsInput{Path: "report.docx", Sheet: "Sheet1", Cells: valid})
+	if result == nil || !result.IsError || !strings.Contains(firstText(result), ".xlsx") {
+		t.Fatalf("non-xlsx result = %+v", result)
+	}
+}
+
+func TestSheetSetCellsAuthorizationAndFailureKeepOriginal(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := Files{workspace: workspace, maxBytes: 1 << 20}
+	if err := files.Write("team", "report.xlsx", "original", false); err != nil {
+		t.Fatal(err)
+	}
+	office := &recordingOffice{}
+	config := Config{OfficeTimeout: "1s", StdioTenantID: "42", MaxUncompressedBytes: 1 << 20, Workspaces: []WorkspaceConfig{{ID: "team", Members: []WorkspaceMember{{UserID: 42, Access: "viewer"}}}}}
+	app := &App{config: config, access: NewAccessManager(config), files: files, officeEngine: office}
+	result, _, _ := app.sheetSetCells(context.Background(), &mcp.CallToolRequest{}, sheetSetCellsInput{Workspace: "team", Path: "report.xlsx", Sheet: "Sheet1", Cells: []sheetSetCell{{Address: "A1", Value: stringPointer("x")}}})
+	if result == nil || !result.IsError || len(office.calls) != 0 {
+		t.Fatalf("unauthorized result=%+v calls=%#v", result, office.calls)
+	}
+
+	if err := files.Write("user-42", "report.xlsx", "original", false); err != nil {
+		t.Fatal(err)
+	}
+	failing := &failingBatchOffice{}
+	app.config = Config{OfficeTimeout: "1s", StdioTenantID: "42", MaxUncompressedBytes: 1 << 20}
+	app.access = NewAccessManager(Config{})
+	app.officeEngine = failing
+	result, _, _ = app.sheetSetCells(context.Background(), &mcp.CallToolRequest{}, sheetSetCellsInput{Path: "report.xlsx", Sheet: "Sheet1", Cells: []sheetSetCell{{Address: "A1", Value: stringPointer("x")}}})
+	if result == nil || !result.IsError {
+		t.Fatalf("expected failure result, got %+v", result)
+	}
+	data, err := files.Read("user-42", "report.xlsx", 0)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("original changed on failed sheet update: %q, %v", data, err)
+	}
+}
+
+func TestSheetSetCellsIsMutating(t *testing.T) {
+	if !mutatingTool("sheet_set_cells") {
+		t.Fatal("sheet_set_cells must be deduplicated")
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+
 type headerTransport struct{ bearer, context string }
 
 func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {

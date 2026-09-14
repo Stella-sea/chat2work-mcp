@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -75,6 +77,7 @@ func (a *App) Server() *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{Name: "doc_create", Description: "Create an Office document in a workspace using OfficeCLI." + workspaceNote}, instrument(a, "doc_create", a.docCreate))
 	mcp.AddTool(server, &mcp.Tool{Name: "doc_edit", Description: "Apply OfficeCLI operations to a document in a workspace." + workspaceNote}, instrument(a, "doc_edit", a.docEdit))
 	mcp.AddTool(server, &mcp.Tool{Name: "doc_query", Description: "Query an Office document in a workspace using OfficeCLI JSON output." + workspaceNote}, instrument(a, "doc_query", a.docQuery))
+	mcp.AddTool(server, &mcp.Tool{Name: "sheet_set_cells", Description: "Atomically set multiple cells in one worksheet of an .xlsx workbook. Use cells[].value for text, numbers, or Excel formulas beginning with '='; cells[].props optionally maps OfficeCLI cell formatting properties, for example {\"bold\":\"true\",\"fill\":\"FFF2CC\"}." + workspaceNote}, instrument(a, "sheet_set_cells", a.sheetSetCells))
 	return server
 }
 
@@ -345,6 +348,17 @@ type docQueryInput struct {
 	Path      string `json:"path"`
 	Selector  string `json:"selector"`
 }
+type sheetSetCellsInput struct {
+	Workspace string         `json:"workspace,omitempty"`
+	Path      string         `json:"path"`
+	Sheet     string         `json:"sheet"`
+	Cells     []sheetSetCell `json:"cells"`
+}
+type sheetSetCell struct {
+	Address string            `json:"address"`
+	Value   *string           `json:"value,omitempty"`
+	Props   map[string]string `json:"props,omitempty"`
+}
 
 func (a *App) officeRun(ctx context.Context, workspace string, args ...string) (string, error) {
 	root, err := a.files.workspace.Root(workspace)
@@ -448,6 +462,170 @@ func (a *App) docEdit(ctx context.Context, req *mcp.CallToolRequest, in docEditI
 		return toolError(err)
 	}
 	return textResult(map[string]string{"status": "edited", "path": cleanRel})
+}
+
+const (
+	maxSheetSetCells = 1000
+	maxExcelColumn   = 16384 // XFD
+	maxExcelRow      = 1048576
+)
+
+func (a *App) sheetSetCells(ctx context.Context, req *mcp.CallToolRequest, in sheetSetCellsInput) (*mcp.CallToolResult, any, error) {
+	grant, err := a.grant(req, in.Workspace, true, false)
+	if err != nil {
+		return toolError(err)
+	}
+	if !strings.EqualFold(filepath.Ext(in.Path), ".xlsx") {
+		return toolError(fmt.Errorf("sheet_set_cells path must end in .xlsx"))
+	}
+	commands, err := sheetSetCellCommands(in.Sheet, in.Cells)
+	if err != nil {
+		return toolError(err)
+	}
+	commandJSON, err := json.Marshal(commands)
+	if err != nil {
+		return toolError(fmt.Errorf("encode cell commands: %w", err))
+	}
+	root, err := a.files.workspace.Root(grant.ID)
+	if err != nil {
+		return toolError(err)
+	}
+	final, err := resolve(root, in.Path, false)
+	if err != nil {
+		return toolError(friendlyPathError(err))
+	}
+	if err := checkOfficeInput(final, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
+		return toolError(err)
+	}
+	cleanRel := filepath.ToSlash(filepath.Clean(in.Path))
+	tempRel := tempDocumentPath(cleanRel)
+	tempAbs := filepath.Join(root, filepath.FromSlash(tempRel))
+	lock := a.access.Lock(grant.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	defer os.Remove(tempAbs)
+	if err := copyFile(final, tempAbs); err != nil {
+		return toolError(err)
+	}
+	if _, err := a.officeRun(ctx, grant.ID, "batch", tempRel, "--commands", string(commandJSON)); err != nil {
+		return toolError(err)
+	}
+	if err := checkOfficeInput(tempAbs, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
+		return toolError(err)
+	}
+	if err := os.Rename(tempAbs, final); err != nil {
+		return toolError(err)
+	}
+	return textResult(map[string]any{"status": "edited", "path": cleanRel, "sheet": in.Sheet, "cells": len(in.Cells)})
+}
+
+func sheetSetCellCommands(sheet string, cells []sheetSetCell) ([]map[string]any, error) {
+	if err := validateSheetName(sheet); err != nil {
+		return nil, err
+	}
+	if len(cells) == 0 {
+		return nil, fmt.Errorf("cells must contain at least one cell")
+	}
+	if len(cells) > maxSheetSetCells {
+		return nil, fmt.Errorf("cells must contain at most %d cells", maxSheetSetCells)
+	}
+	commands := make([]map[string]any, 0, len(cells))
+	seen := make(map[string]struct{}, len(cells))
+	for i, cell := range cells {
+		address, err := normalizeCellAddress(cell.Address)
+		if err != nil {
+			return nil, fmt.Errorf("cells[%d].address: %w", i, err)
+		}
+		if _, ok := seen[address]; ok {
+			return nil, fmt.Errorf("cells[%d].address duplicates %q", i, address)
+		}
+		seen[address] = struct{}{}
+		if cell.Value == nil && len(cell.Props) == 0 {
+			return nil, fmt.Errorf("cells[%d] must provide value or props", i)
+		}
+		for key := range cell.Props {
+			if strings.EqualFold(key, "value") {
+				return nil, fmt.Errorf("cells[%d].props must not contain value; use cells[%d].value", i, i)
+			}
+		}
+		props := make(map[string]string, len(cell.Props)+1)
+		for key, value := range cell.Props {
+			props[key] = value
+		}
+		if cell.Value != nil {
+			props["value"] = *cell.Value
+		}
+		commands = append(commands, map[string]any{
+			"command": "set",
+			"path":    "/" + sheet + "/" + address,
+			"props":   props,
+		})
+	}
+	return commands, nil
+}
+
+func validateSheetName(sheet string) error {
+	if sheet == "" || utf8.RuneCountInString(sheet) > 255 {
+		return fmt.Errorf("sheet must contain between 1 and 255 characters")
+	}
+	if sheet == "." || sheet == ".." {
+		return fmt.Errorf("sheet name is not a valid OfficeCLI path segment")
+	}
+	for _, r := range sheet {
+		if strings.ContainsRune("/\\:*?[]", r) || unicode.IsControl(r) {
+			return fmt.Errorf("sheet name must not contain invalid characters")
+		}
+	}
+	return nil
+}
+
+func normalizeCellAddress(address string) (string, error) {
+	if address == "" || strings.TrimSpace(address) != address {
+		return "", fmt.Errorf("must be a single A1 cell address")
+	}
+	i := 0
+	if address[i] == '$' {
+		i++
+	}
+	columnStart := i
+	for i < len(address) {
+		b := address[i]
+		if (b < 'A' || b > 'Z') && (b < 'a' || b > 'z') {
+			break
+		}
+		i++
+	}
+	if i == columnStart {
+		return "", fmt.Errorf("must be a single A1 cell address")
+	}
+	column := strings.ToUpper(address[columnStart:i])
+	if i < len(address) && address[i] == '$' {
+		i++
+	}
+	if i == len(address) {
+		return "", fmt.Errorf("must be a single A1 cell address")
+	}
+	columnNumber := 0
+	for i := 0; i < len(column); i++ {
+		columnNumber = columnNumber*26 + int(column[i]-'A'+1)
+		if columnNumber > maxExcelColumn {
+			return "", fmt.Errorf("column exceeds Excel maximum XFD")
+		}
+	}
+	row := 0
+	for _, r := range address[i:] {
+		if r < '0' || r > '9' {
+			return "", fmt.Errorf("must be a single A1 cell address")
+		}
+		row = row*10 + int(r-'0')
+		if row > maxExcelRow {
+			return "", fmt.Errorf("row exceeds Excel maximum %d", maxExcelRow)
+		}
+	}
+	if row == 0 {
+		return "", fmt.Errorf("row must be at least 1")
+	}
+	return fmt.Sprintf("%s%d", column, row), nil
 }
 
 func isJSONArray(raw json.RawMessage) bool {

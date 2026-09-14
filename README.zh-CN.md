@@ -5,7 +5,7 @@
 ## 功能边界
 
 - 工作区文件工具：`fs_list`、`fs_read`、`fs_write`、`fs_edit`、`fs_move`、`fs_delete`、`fs_search`、`fs_link`。
-- OfficeCLI 文档工具：`doc_create`、`doc_edit`、`doc_query`。
+- OfficeCLI 文档工具：`doc_create`、`doc_edit`、`doc_query`、`sheet_set_cells`。
 - `workspace_list`：查看管理员分配给当前用户的工作区。
 - DEEIX 走 Streamable HTTP，stdio 仅供显式本地调试。
 - 不做 shell 执行、沙箱、RAG、web search、skill 托管、插件市场。
@@ -79,7 +79,7 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 
 日志为 stderr 上的结构化 JSON（stdout 保留给 stdio 传输），由 `log_level` 控制。每个 HTTP 请求与工具调用都会带上 `request_id`：优先取 `X-Request-Id` 头或 DEEIX 签名上下文中的 `request_id`，否则自动生成。日志不含文件内容、token 或签名上下文。
 
-当 DEEIX 的签名上下文带有 `request_id` 时，重试同一个修改操作是安全的。对于 `fs_write`、`fs_edit`、`fs_move`、`fs_delete`、`doc_create`、`doc_edit`，服务按已认证用户、请求 ID、工具名和规范化参数去重。已完成的 MCP 结果会按 `request_id_cache_ttl`（默认 `10m`）缓存，并受 `request_id_cache_entries`（默认 `1000`）限制。读取操作绝不缓存；没有签名 request_id 的调用保持原行为；审计和日志会以 `deduplicated: true` 标记重放调用。
+当 DEEIX 的签名上下文带有 `request_id` 时，重试同一个修改操作是安全的。对于 `fs_write`、`fs_edit`、`fs_move`、`fs_delete`、`doc_create`、`doc_edit`、`sheet_set_cells`，服务按已认证用户、请求 ID、工具名和规范化参数去重。已完成的 MCP 结果会按 `request_id_cache_ttl`（默认 `10m`）缓存，并受 `request_id_cache_entries`（默认 `1000`）限制。读取操作绝不缓存；没有签名 request_id 的调用保持原行为；审计和日志会以 `deduplicated: true` 标记重放调用。
 
 Office 文档在交给 OfficeCLI 前会做大小检查（`max_file_bytes`）与解压膨胀检查（`max_uncompressed_bytes`）。会修改文档的 Office 操作先作用于同目录临时文件，仅在成功后重命名覆盖目标，因此失败或超时的编辑不会破坏原文档。
 
@@ -88,6 +88,8 @@ Office 文档在交给 OfficeCLI 前会做大小检查（`max_file_bytes`）与�
 OfficeCLI 内置在运行镜像中，不再挂载。Dockerfile 会按构建目标下载对应 release 资产、用固定 SHA256 校验、赋予可执行权限，并在每次调用时设置 `OFFICECLI_SKIP_UPDATE=1` 与 `OFFICECLI_NO_AUTO_RESIDENT=1`。
 
 `create` 默认会启动后台 resident 进程，等于每个文档泄漏一个进程。`OFFICECLI_NO_AUTO_RESIDENT=1` 关闭该行为，使每次调用都是自包含的 open/save/exit，无跨请求状态。`max_office_concurrency` 信号量（默认 4）限制同时运行的 OfficeCLI 进程数。
+
+`sheet_set_cells` 会把同一工作表内最多 1000 个 A1 单元格转换为 OfficeCLI `set` 批处理命令。`value` 以 `=` 开头时为 Excel 公式；可选 `props` 用于有限的 OfficeCLI 单元格格式属性。它不支持跨工作表或跨工作簿。
 
 实测二进制带来的两个打包要点：
 
