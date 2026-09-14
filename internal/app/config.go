@@ -12,6 +12,7 @@ import (
 
 type Config struct {
 	ListenAddr           string            `yaml:"listen_addr"`
+	LogLevel             string            `yaml:"log_level"`
 	MCPToken             string            `yaml:"mcp_token"`
 	MCPUserContextSecret string            `yaml:"mcp_user_context_secret"`
 	WorkspaceRoot        string            `yaml:"workspace_root"`
@@ -58,6 +59,9 @@ func LoadConfig(path string) (Config, error) {
 	applyEnv(&c)
 	if c.ListenAddr == "" {
 		c.ListenAddr = ":8090"
+	}
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
 	}
 	if c.WorkspaceRoot == "" {
 		c.WorkspaceRoot = "/data/workspace"
@@ -142,6 +146,7 @@ func applyEnv(c *Config) {
 		}
 	}
 	set("LISTEN_ADDR", &c.ListenAddr)
+	set("LOG_LEVEL", &c.LogLevel)
 	set("MCP_TOKEN", &c.MCPToken)
 	set("MCP_USER_CONTEXT_SECRET", &c.MCPUserContextSecret)
 	set("WORKSPACE_ROOT", &c.WorkspaceRoot)

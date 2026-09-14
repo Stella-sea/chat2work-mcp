@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -368,6 +369,102 @@ func TestDocEditKeepsOriginalOnFailure(t *testing.T) {
 		if strings.Contains(entry.Name(), ".chat2work-") {
 			t.Fatalf("temporary file left behind: %s", entry.Name())
 		}
+	}
+}
+
+type headerTransport struct{ bearer, context string }
+
+func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "Bearer "+t.bearer)
+	clone.Header.Set("X-Deeix-User-Context", t.context)
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+func TestHTTPHandlerEndToEnd(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := Files{workspace: workspace, maxBytes: 1 << 20}
+	app := &App{
+		config:   Config{MCPToken: "tok", MaxListResults: 100, OfficeTimeout: "1s"},
+		resolver: DeeixResolver{Secret: "secret"},
+		access:   NewAccessManager(Config{}),
+		files:    files,
+		audit:    &Auditor{},
+		logger:   slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	}
+	server := httptest.NewServer(app.HTTPHandler())
+	defer server.Close()
+
+	signedToken := signedContext(t, "secret", 42, time.Now().Add(time.Minute).Unix())
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil)
+	transport := &mcp.StreamableClientTransport{
+		Endpoint:             server.URL,
+		HTTPClient:           &http.Client{Transport: headerTransport{bearer: "tok", context: signedToken}},
+		DisableStandaloneSSE: true,
+	}
+	ctx := context.Background()
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fs_write", Arguments: map[string]any{"path": "hello.txt", "content": "hi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("tool error: %+v", result)
+	}
+	data, err := files.Read("user-42", "hello.txt", 0)
+	if err != nil || string(data) != "hi" {
+		t.Fatalf("Read() = %q, %v", data, err)
+	}
+}
+
+func TestStatusRecorderPreservesFlush(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	wrapped := &statusRecorder{ResponseWriter: recorder, status: http.StatusOK}
+	if _, err := wrapped.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := http.NewResponseController(wrapped).Flush(); err != nil {
+		t.Fatalf("flush through wrapper failed: %v", err)
+	}
+	if !recorder.Flushed {
+		t.Fatal("underlying writer was not flushed through the wrapper")
+	}
+}
+
+func TestRequestLoggingIncludesRequestID(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buffer, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	app := &App{config: Config{MCPToken: "tok", WorkspaceRoot: t.TempDir(), OfficeCLIPath: "missing"}, access: NewAccessManager(Config{}), audit: &Auditor{}, logger: logger}
+	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	request.Header.Set("X-Request-Id", "req-abc")
+	app.HTTPHandler().ServeHTTP(httptest.NewRecorder(), request)
+	output := buffer.String()
+	if !strings.Contains(output, `"request_id":"req-abc"`) || !strings.Contains(output, "http_request") {
+		t.Fatalf("expected request id in logs, got: %s", output)
+	}
+}
+
+func TestToolCallLoggingIncludesRequestID(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buffer, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	app := &App{config: Config{StdioTenantID: "42"}, access: NewAccessManager(Config{}), audit: &Auditor{}, logger: logger}
+	handler := instrument(app, "fs_read", func(context.Context, *mcp.CallToolRequest, readInput) (*mcp.CallToolResult, any, error) {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil, nil
+	})
+	ctx := withRequestID(context.Background(), "req-xyz")
+	if _, _, err := handler(ctx, &mcp.CallToolRequest{}, readInput{Path: "a.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	output := buffer.String()
+	if !strings.Contains(output, `"request_id":"req-xyz"`) || !strings.Contains(output, "tool_call") {
+		t.Fatalf("expected tool_call log with request id, got: %s", output)
 	}
 }
 

@@ -1,4 +1,6 @@
 listen_addr: ":8090"
+# debug, info, warn, or error. Logs are JSON on stderr.
+log_level: "info"
 mcp_token: "replace-with-a-long-random-static-token"
 mcp_user_context_secret: "replace-with-the-same-value-as-deeix"
 workspace_root: "/data/workspace"

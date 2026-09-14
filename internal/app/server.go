@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -22,6 +23,7 @@ type App struct {
 	officeEngine OfficeEngine
 	downloads    DownloadSigner
 	audit        *Auditor
+	logger       *slog.Logger
 }
 
 func New(config Config) (*App, error) {
@@ -33,6 +35,8 @@ func New(config Config) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open audit log: %w", err)
 	}
+	logger := newLogger(config.LogLevel)
+	slog.SetDefault(logger)
 	return &App{
 		config:   config,
 		resolver: DeeixResolver{Secret: config.MCPUserContextSecret},
@@ -47,6 +51,7 @@ func New(config Config) (*App, error) {
 		officeEngine: NewOfficeCLI(config.OfficeCLIPath, config.MaxOfficeConcurrency),
 		downloads:    NewDownloadSigner(config.DownloadSecret, config.DownloadBaseURL, config.DownloadDuration()),
 		audit:        auditor,
+		logger:       logger,
 	}, nil
 }
 
@@ -80,7 +85,7 @@ func (a *App) HTTPHandler() http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/readyz", a.readyz)
-	return mux
+	return a.logRequests(mux)
 }
 
 // readyz reports whether the service can serve tool calls: OfficeCLI must be

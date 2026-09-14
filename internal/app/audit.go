@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 // content or secrets.
 type AuditEvent struct {
 	Time        time.Time `json:"time"`
+	RequestID   string    `json:"request_id,omitempty"`
 	UserID      uint64    `json:"user_id,omitempty"`
 	Workspace   string    `json:"workspace,omitempty"`
 	Tool        string    `json:"tool"`
@@ -133,9 +135,14 @@ func instrument[In any](a *App, name string, h func(context.Context, *mcp.CallTo
 		start := time.Now()
 		result, out, err := h(ctx, req, in)
 		event := AuditEvent{Tool: name, Outcome: "ok", DurationMS: time.Since(start).Milliseconds()}
+		requestID := requestIDFrom(ctx)
 		if identity, idErr := a.identity(req); idErr == nil {
 			event.UserID = identity.UserID
+			if identity.RequestID != "" {
+				requestID = identity.RequestID
+			}
 		}
+		event.RequestID = requestID
 		if target, ok := any(in).(auditable); ok {
 			event.Workspace, event.Path = target.auditTarget()
 		}
@@ -151,6 +158,21 @@ func instrument[In any](a *App, name string, h func(context.Context, *mcp.CallTo
 			event.Error = err.Error()
 		}
 		a.audit.Record(event)
+		level := slog.LevelInfo
+		if event.Outcome == "error" {
+			level = slog.LevelWarn
+		}
+		a.log().LogAttrs(ctx, level, "tool_call",
+			slog.String("request_id", requestID),
+			slog.Uint64("user_id", event.UserID),
+			slog.String("workspace", event.Workspace),
+			slog.String("tool", name),
+			slog.String("path", event.Path),
+			slog.String("outcome", event.Outcome),
+			slog.Int64("duration_ms", event.DurationMS),
+			slog.Int("result_bytes", event.ResultBytes),
+			slog.String("error", event.Error),
+		)
 		return result, out, err
 	}
 }

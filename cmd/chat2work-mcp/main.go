@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,11 +20,13 @@ func main() {
 	flag.Parse()
 	config, err := app.LoadConfig(*configPath)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("load config", "error", err)
+		os.Exit(1)
 	}
 	server, err := app.New(config)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("start server", "error", err)
+		os.Exit(1)
 	}
 	defer server.Close()
 
@@ -33,7 +35,8 @@ func main() {
 
 	if *stdio {
 		if err := server.RunStdio(ctx); err != nil {
-			log.Fatal(err)
+			slog.Error("stdio server stopped", "error", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -46,8 +49,9 @@ func main() {
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("chat2work-mcp listening on %s", config.ListenAddr)
+	slog.Info("chat2work-mcp listening", "addr", config.ListenAddr)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+		slog.Error("http server stopped", "error", err)
+		os.Exit(1)
 	}
 }
