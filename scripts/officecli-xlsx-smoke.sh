@@ -44,7 +44,7 @@ assert_json "$a2" '
 assert_json "$a3" '
   .success == true and
   .data.results[0].path == "/Sheet1/A3" and
-  .data.results[0].text == ""
+  .data.results[0].text == "(empty)"
 '
 assert_json "$validation" '
   .success == true and
