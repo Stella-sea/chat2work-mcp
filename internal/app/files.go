@@ -222,11 +222,53 @@ func (f Files) CheckWriteAllowed(tenant string, isNew bool) error {
 	return nil
 }
 
+// CheckOfficeOutputAllowed verifies the quota using the completed OfficeCLI
+// output while excluding its transient sibling copy from workspace usage.
+func (f Files) CheckOfficeOutputAllowed(tenant, existingPath, outputPath string, isNew bool) error {
+	if f.maxWorkspaceBytes <= 0 && f.maxWorkspaceFiles <= 0 {
+		return nil
+	}
+	root, err := f.workspace.Root(tenant)
+	if err != nil {
+		return err
+	}
+	output, err := os.Stat(outputPath)
+	if err != nil {
+		return err
+	}
+	var existingSize int64
+	if !isNew {
+		existing, err := os.Stat(existingPath)
+		if err != nil {
+			return err
+		}
+		existingSize = existing.Size()
+	}
+	used, count, err := usageExactExcluding(root, outputPath)
+	if err != nil {
+		return err
+	}
+	if f.maxWorkspaceBytes > 0 && used-existingSize+output.Size() > f.maxWorkspaceBytes {
+		return fmt.Errorf("workspace storage quota exceeded (%d bytes)", f.maxWorkspaceBytes)
+	}
+	if isNew && f.maxWorkspaceFiles > 0 && count+1 > f.maxWorkspaceFiles {
+		return fmt.Errorf("workspace file count quota exceeded (%d files)", f.maxWorkspaceFiles)
+	}
+	return nil
+}
+
 func (f Files) usage(root string) (int64, int, error) {
+	return f.usageExcluding(root, "")
+}
+
+func (f Files) usageExcluding(root, excluded string) (int64, int, error) {
 	var bytes int64
 	var count int
-	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			return nil
+		}
+		if path == excluded {
 			return nil
 		}
 		if d.IsDir() {
@@ -249,6 +291,30 @@ func (f Files) usage(root string) (int64, int, error) {
 	if errors.Is(err, errLimitReached) {
 		return bytes, count, nil
 	}
+	return bytes, count, err
+}
+
+// usageExactExcluding deliberately scans the complete workspace. Replacement
+// quota checks must account for the old file even when the workspace is
+// already over a configured cap, so the early-abort scan is not sufficient.
+func usageExactExcluding(root, excluded string) (int64, int, error) {
+	var bytes int64
+	var count int
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if path == excluded || d.IsDir() {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+		bytes += info.Size()
+		count++
+		return nil
+	})
 	return bytes, count, err
 }
 

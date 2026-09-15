@@ -20,6 +20,12 @@ RUN apk add --no-cache su-exec libstdc++ icu-libs \
  && wget -qO /usr/local/bin/officecli "https://github.com/iOfficeAI/OfficeCLI/releases/download/v${OFFICECLI_VERSION}/${asset}" \
  && echo "${sha}  /usr/local/bin/officecli" | sha256sum -c - \
  && chmod +x /usr/local/bin/officecli
+COPY scripts/officecli-xlsx-smoke.sh /tmp/officecli-xlsx-smoke.sh
+RUN apk add --no-cache --virtual .officecli-smoke-deps jq \
+ && chmod +x /tmp/officecli-xlsx-smoke.sh \
+ && /tmp/officecli-xlsx-smoke.sh \
+ && rm /tmp/officecli-xlsx-smoke.sh \
+ && apk del .officecli-smoke-deps
 COPY --from=build /out/chat2work-mcp /usr/local/bin/chat2work-mcp
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

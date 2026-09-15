@@ -418,6 +418,9 @@ func (a *App) docCreate(ctx context.Context, req *mcp.CallToolRequest, in docCre
 	if err := checkOfficeInput(tempAbs, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
 		return toolError(err)
 	}
+	if err := a.files.CheckOfficeOutputAllowed(grant.ID, final, tempAbs, isNew); err != nil {
+		return toolError(err)
+	}
 	if err := os.Rename(tempAbs, final); err != nil {
 		return toolError(err)
 	}
@@ -456,6 +459,9 @@ func (a *App) docEdit(ctx context.Context, req *mcp.CallToolRequest, in docEditI
 		return toolError(err)
 	}
 	if err := checkOfficeInput(tempAbs, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
+		return toolError(err)
+	}
+	if err := a.files.CheckOfficeOutputAllowed(grant.ID, final, tempAbs, false); err != nil {
 		return toolError(err)
 	}
 	if err := os.Rename(tempAbs, final); err != nil {
@@ -511,6 +517,9 @@ func (a *App) sheetSetCells(ctx context.Context, req *mcp.CallToolRequest, in sh
 		return toolError(err)
 	}
 	if err := checkOfficeInput(tempAbs, a.config.MaxFileBytes, a.config.MaxUncompressedBytes); err != nil {
+		return toolError(err)
+	}
+	if err := a.files.CheckOfficeOutputAllowed(grant.ID, final, tempAbs, false); err != nil {
 		return toolError(err)
 	}
 	if err := os.Rename(tempAbs, final); err != nil {

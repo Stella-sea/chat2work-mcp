@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -345,6 +346,15 @@ func (o *failingBatchOffice) Execute(_ context.Context, _ string, args []string)
 	return "", errors.New("boom")
 }
 
+type sizedOffice struct{ size int }
+
+func (o sizedOffice) Execute(_ context.Context, root string, args []string) (string, error) {
+	if len(args) < 2 || (args[0] != "create" && args[0] != "batch") {
+		return "", fmt.Errorf("unexpected office arguments: %v", args)
+	}
+	return "", os.WriteFile(filepath.Join(root, filepath.FromSlash(args[1])), make([]byte, o.size), 0o640)
+}
+
 func TestDocEditKeepsOriginalOnFailure(t *testing.T) {
 	workspace, err := NewWorkspace(t.TempDir())
 	if err != nil {
@@ -371,6 +381,102 @@ func TestDocEditKeepsOriginalOnFailure(t *testing.T) {
 		if strings.Contains(entry.Name(), ".chat2work-") {
 			t.Fatalf("temporary file left behind: %s", entry.Name())
 		}
+	}
+}
+
+func TestOfficeMutationsRejectOutputBeyondWorkspaceQuota(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*App) *mcp.CallToolResult
+	}{
+		{
+			name: "create",
+			run: func(app *App) *mcp.CallToolResult {
+				result, _, _ := app.docCreate(context.Background(), &mcp.CallToolRequest{}, docCreateInput{Path: "created.docx", Kind: "docx"})
+				return result
+			},
+		},
+		{
+			name: "edit",
+			run: func(app *App) *mcp.CallToolResult {
+				result, _, _ := app.docEdit(context.Background(), &mcp.CallToolRequest{}, docEditInput{Path: "document.docx", Ops: json.RawMessage(`[]`)})
+				return result
+			},
+		},
+		{
+			name: "sheet cells",
+			run: func(app *App) *mcp.CallToolResult {
+				result, _, _ := app.sheetSetCells(context.Background(), &mcp.CallToolRequest{}, sheetSetCellsInput{Path: "sheet.xlsx", Sheet: "Sheet1", Cells: []sheetSetCell{{Address: "A1", Value: stringPointer("x")}}})
+				return result
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace, err := NewWorkspace(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := Files{workspace: workspace, maxBytes: 1024, maxWorkspaceBytes: 10}
+			if test.name != "create" {
+				path := "document.docx"
+				if test.name == "sheet cells" {
+					path = "sheet.xlsx"
+				}
+				if err := files.Write("user-42", path, "original", false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			app := &App{
+				config:       Config{OfficeTimeout: "1s", StdioTenantID: "42", MaxFileBytes: 1024, MaxUncompressedBytes: 1024},
+				access:       NewAccessManager(Config{}),
+				files:        files,
+				officeEngine: sizedOffice{size: 11},
+			}
+			result := test.run(app)
+			if result == nil || !result.IsError || !strings.Contains(firstText(result), "workspace storage quota exceeded") {
+				t.Fatalf("expected workspace quota error, got %+v", result)
+			}
+			if test.name == "create" {
+				if _, err := files.Read("user-42", "created.docx", 0); err == nil {
+					t.Fatal("over-quota document was created")
+				}
+				return
+			}
+			path := "document.docx"
+			if test.name == "sheet cells" {
+				path = "sheet.xlsx"
+			}
+			data, err := files.Read("user-42", path, 0)
+			if err != nil || string(data) != "original" {
+				t.Fatalf("original changed after quota failure: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestDocEditAllowsOutputAtWorkspaceQuota(t *testing.T) {
+	workspace, err := NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := Files{workspace: workspace, maxBytes: 1024, maxWorkspaceBytes: 10}
+	if err := files.Write("user-42", "document.docx", "original", false); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{
+		config:       Config{OfficeTimeout: "1s", StdioTenantID: "42", MaxFileBytes: 1024, MaxUncompressedBytes: 1024},
+		access:       NewAccessManager(Config{}),
+		files:        files,
+		officeEngine: sizedOffice{size: 10},
+	}
+	result, _, err := app.docEdit(context.Background(), &mcp.CallToolRequest{}, docEditInput{Path: "document.docx", Ops: json.RawMessage(`[]`)})
+	if err != nil || result.IsError {
+		t.Fatalf("docEdit() = %+v, %v", result, err)
+	}
+	data, err := files.Read("user-42", "document.docx", 0)
+	if err != nil || len(data) != 10 {
+		t.Fatalf("updated document = %d bytes, %v", len(data), err)
 	}
 }
 
