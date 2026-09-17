@@ -69,7 +69,7 @@ The service stays on `deeix-chat-network` and publishes only `127.0.0.1:8090` fo
 
 ## Configuration
 
-Every YAML setting may be overridden by its uppercase environment name: `LISTEN_ADDR`, `LOG_LEVEL`, `MCP_TOKEN`, `MCP_USER_CONTEXT_SECRET`, `WORKSPACE_ROOT`, `MAX_FILE_BYTES`, `MAX_WORKSPACE_BYTES`, `MAX_WORKSPACE_FILES`, `MAX_LIST_RESULTS`, `MAX_SEARCH_RESULTS`, `OFFICECLI_PATH`, `OFFICE_TIMEOUT`, `MAX_OFFICE_CONCURRENCY`, `MAX_UNCOMPRESSED_BYTES`, `DELETE_ENABLED`, `AUDIT_LOG_PATH`, `AUDIT_MAX_BYTES`, `AUDIT_MAX_BACKUPS`, `DOWNLOAD_BASE_URL`, `DOWNLOAD_TTL`, `DOWNLOAD_SECRET`, `REQUEST_ID_CACHE_TTL`, `REQUEST_ID_CACHE_ENTRIES`, and `STDIO_TENANT_ID`.
+Environment overrides are supported for `LISTEN_ADDR`, `LOG_LEVEL`, `MCP_TOKEN`, `MCP_USER_CONTEXT_SECRET`, `WORKSPACE_ROOT`, `MAX_FILE_BYTES`, `OFFICECLI_PATH`, `OFFICE_TIMEOUT`, `MAX_OFFICE_CONCURRENCY`, `MAX_UNCOMPRESSED_BYTES`, `DELETE_ENABLED`, `AUDIT_LOG_PATH`, `AUDIT_MAX_BYTES`, `AUDIT_MAX_BACKUPS`, `DOWNLOAD_BASE_URL`, `DOWNLOAD_TTL`, `DOWNLOAD_SECRET`, `REQUEST_ID_CACHE_TTL`, `REQUEST_ID_CACHE_ENTRIES`, and `STDIO_TENANT_ID`. `max_workspace_bytes`, `max_workspace_files`, `max_list_results`, `max_search_results`, and `workspaces` are currently YAML-only.
 
 `GET /healthz` is an unauthenticated liveness probe. `GET /readyz` returns 200 only when OfficeCLI is resolvable and the workspace root is writable, otherwise 503. Both are safe for container orchestration health checks.
 
@@ -81,7 +81,7 @@ Logs are structured JSON on stderr (stdout stays reserved for the stdio transpor
 
 DEEIX retries can safely repeat a mutating call when its signed context includes a `request_id`. For `fs_write`, `fs_edit`, `fs_move`, `fs_delete`, `doc_create`, `doc_edit`, and `sheet_set_cells`, the service deduplicates calls by authenticated user, request id, tool, and normalized parameters. It caches completed MCP results for `request_id_cache_ttl` (default `10m`) and bounds the cache to `request_id_cache_entries` (default `1000`). Reads are never cached, calls without a signed request id run normally, and audit/log records mark replays with `deduplicated: true`.
 
-Office documents are size-checked against `max_file_bytes` and decompression-checked against `max_uncompressed_bytes` before they are handed to OfficeCLI. Mutating Office operations run against a temporary sibling file and are renamed over the target only on success, so a failed or timed-out edit leaves the original document untouched.
+Office documents are size-checked against `max_file_bytes` and decompression-checked against `max_uncompressed_bytes` before they are handed to OfficeCLI. Mutating Office operations run against a temporary sibling file and are renamed over the target only on success. Before that rename, `doc_create`, `doc_edit`, and `sheet_set_cells` check the completed output against workspace byte and file-count quotas, excluding the temporary sibling and accounting for a replaced file's old size. Failures, timeouts, and quota rejections leave the original document untouched. Temporary-copy disk space is not reserved in advance, so an insufficient filesystem safely fails during copying or OfficeCLI output.
 
 ## OfficeCLI: bundled, pinned, and multi-arch
 
@@ -89,7 +89,7 @@ OfficeCLI is baked into the runtime image, not mounted. The Dockerfile downloads
 
 `create` auto-starts a background resident process by default, which would leak a process per document. `OFFICECLI_NO_AUTO_RESIDENT=1` disables that, so every call is a self-contained open/save/exit with no cross-request state. A `max_office_concurrency` semaphore (default 4) bounds how many OfficeCLI processes run at once.
 
-`sheet_set_cells` converts a same-worksheet batch of up to 1000 A1 cells into OfficeCLI `set` commands. A `value` beginning with `=` is an Excel formula; optional `props` apply limited OfficeCLI cell formatting. It never spans worksheets or workbooks.
+`sheet_set_cells` converts a same-worksheet batch of up to 1000 A1 cells into OfficeCLI `set` commands. A `value` beginning with `=` is an Excel formula; optional `props` is a string-property map passed through to OfficeCLI, except that any case variant of `value` is rejected in favor of `cells[].value`. It never spans worksheets or workbooks.
 
 Two facts learned from the real binary matter for packaging:
 
@@ -121,6 +121,7 @@ Validated against `officecli-linux-alpine-x64` v1.0.149 inside `alpine:3.22` wit
 - `batch <file> --commands <JSON-array>` is the supported bulk-edit invocation. `ops` supplied to the MCP is forwarded as that JSON array.
 - With `OFFICECLI_NO_AUTO_RESIDENT=1`, `create`, `batch`, and `query` leave no background process; process count returns to zero after each call and the file is flushed on exit.
 - `create`/`close` succeeded for `.docx`, `.xlsx`, and `.pptx`; `--locale zh-CN` creation succeeded; DOCX `query --json` succeeded.
+- The build-stage XLSX smoke test creates a workbook, batches text, a formula, an explicit empty value, and `bold`/`fill` formatting, then verifies `get --json` and zero `validate --json` errors. OfficeCLI v1.0.149 reads the explicit empty cell back as `"(empty)"`.
 - End-to-end through the built image: signed `fs_write`, `fs_list`, `doc_create`, `fs_link`, and a signed download all succeeded.
 - PDF conversion is unavailable without an OfficeCLI exporter plugin.
 
@@ -128,7 +129,7 @@ Before enabling the Office tools in production, repeat and record these checks a
 
 ## CI and releases
 
-`.github/workflows/ci.yml` runs `go vet`, `go test -race`, `go build`, and a Docker image build on every push and pull request. `.github/workflows/release.yml` builds and pushes a multi-arch (`linux/amd64`, `linux/arm64`) image to GHCR when a `v*` tag is pushed. OfficeCLI updates stay manual by design (see the version policy above); a scheduled workflow that opens a bump PR is a reasonable future addition.
+`.github/workflows/ci.yml` runs `go vet`, `go test -race`, `go build`, and a QEMU `linux/amd64,linux/arm64` Docker build on every push and pull request. The Docker build executes the pinned OfficeCLI XLSX smoke test for both architectures. `.github/workflows/release.yml` builds and pushes the same multi-arch image to GHCR when a `v*` tag is pushed. OfficeCLI updates stay manual by design (see the version policy above); a scheduled workflow that opens a bump PR is a reasonable future addition.
 
 ## Development
 

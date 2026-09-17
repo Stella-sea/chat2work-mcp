@@ -69,7 +69,7 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 
 ## 配置项
 
-每个 YAML 配置都可用大写环境变量覆盖：`LISTEN_ADDR`、`LOG_LEVEL`、`MCP_TOKEN`、`MCP_USER_CONTEXT_SECRET`、`WORKSPACE_ROOT`、`MAX_FILE_BYTES`、`MAX_WORKSPACE_BYTES`、`MAX_WORKSPACE_FILES`、`MAX_LIST_RESULTS`、`MAX_SEARCH_RESULTS`、`OFFICECLI_PATH`、`OFFICE_TIMEOUT`、`MAX_OFFICE_CONCURRENCY`、`MAX_UNCOMPRESSED_BYTES`、`DELETE_ENABLED`、`AUDIT_LOG_PATH`、`AUDIT_MAX_BYTES`、`AUDIT_MAX_BACKUPS`、`DOWNLOAD_BASE_URL`、`DOWNLOAD_TTL`、`DOWNLOAD_SECRET`、`REQUEST_ID_CACHE_TTL`、`REQUEST_ID_CACHE_ENTRIES`、`STDIO_TENANT_ID`。
+可用环境变量覆盖的配置项为：`LISTEN_ADDR`、`LOG_LEVEL`、`MCP_TOKEN`、`MCP_USER_CONTEXT_SECRET`、`WORKSPACE_ROOT`、`MAX_FILE_BYTES`、`OFFICECLI_PATH`、`OFFICE_TIMEOUT`、`MAX_OFFICE_CONCURRENCY`、`MAX_UNCOMPRESSED_BYTES`、`DELETE_ENABLED`、`AUDIT_LOG_PATH`、`AUDIT_MAX_BYTES`、`AUDIT_MAX_BACKUPS`、`DOWNLOAD_BASE_URL`、`DOWNLOAD_TTL`、`DOWNLOAD_SECRET`、`REQUEST_ID_CACHE_TTL`、`REQUEST_ID_CACHE_ENTRIES`、`STDIO_TENANT_ID`。`max_workspace_bytes`、`max_workspace_files`、`max_list_results`、`max_search_results` 与 `workspaces` 目前只能在 YAML 中配置。
 
 `GET /healthz` 是无需鉴权的存活探针；`GET /readyz` 仅在 OfficeCLI 可解析且工作区根目录可写时返回 200，否则 503。两者都可用于容器编排的健康检查。
 
@@ -81,7 +81,7 @@ X-Deeix-User-Context: ${DEEIX_SIGNED_USER_CONTEXT}
 
 当 DEEIX 的签名上下文带有 `request_id` 时，重试同一个修改操作是安全的。对于 `fs_write`、`fs_edit`、`fs_move`、`fs_delete`、`doc_create`、`doc_edit`、`sheet_set_cells`，服务按已认证用户、请求 ID、工具名和规范化参数去重。已完成的 MCP 结果会按 `request_id_cache_ttl`（默认 `10m`）缓存，并受 `request_id_cache_entries`（默认 `1000`）限制。读取操作绝不缓存；没有签名 request_id 的调用保持原行为；审计和日志会以 `deduplicated: true` 标记重放调用。
 
-Office 文档在交给 OfficeCLI 前会做大小检查（`max_file_bytes`）与解压膨胀检查（`max_uncompressed_bytes`）。会修改文档的 Office 操作先作用于同目录临时文件，仅在成功后重命名覆盖目标，因此失败或超时的编辑不会破坏原文档。
+Office 文档在交给 OfficeCLI 前会做大小检查（`max_file_bytes`）与解压膨胀检查（`max_uncompressed_bytes`）。会修改文档的 Office 操作先作用于同目录临时文件，仅在成功后重命名覆盖目标。在 rename 前，`doc_create`、`doc_edit` 与 `sheet_set_cells` 会按完成后的输出检查工作区字节数和文件数配额，排除临时 sibling 文件，并在替换时扣除旧文件大小。失败、超时或配额拒绝均不会改动原文档。临时副本的瞬时磁盘空间不预留；文件系统空间不足会在复制或 OfficeCLI 输出时安全失败。
 
 ## OfficeCLI：内置、固定版本、多架构
 
@@ -89,7 +89,7 @@ OfficeCLI 内置在运行镜像中，不再挂载。Dockerfile 会按构建目�
 
 `create` 默认会启动后台 resident 进程，等于每个文档泄漏一个进程。`OFFICECLI_NO_AUTO_RESIDENT=1` 关闭该行为，使每次调用都是自包含的 open/save/exit，无跨请求状态。`max_office_concurrency` 信号量（默认 4）限制同时运行的 OfficeCLI 进程数。
 
-`sheet_set_cells` 会把同一工作表内最多 1000 个 A1 单元格转换为 OfficeCLI `set` 批处理命令。`value` 以 `=` 开头时为 Excel 公式；可选 `props` 用于有限的 OfficeCLI 单元格格式属性。它不支持跨工作表或跨工作簿。
+`sheet_set_cells` 会把同一工作表内最多 1000 个 A1 单元格转换为 OfficeCLI `set` 批处理命令。`value` 以 `=` 开头时为 Excel 公式；可选 `props` 是透传给 OfficeCLI 的字符串属性映射，但任意大小写的 `value` 键均会被拒绝，必须使用 `cells[].value`。它不支持跨工作表或跨工作簿。
 
 实测二进制带来的两个打包要点：
 
@@ -121,6 +121,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/chat2work-m
 - `batch <file> --commands <JSON 数组>` 是受支持的批量编辑调用；MCP 的 `ops` 就作为该 JSON 数组转发。
 - 设置 `OFFICECLI_NO_AUTO_RESIDENT=1` 后，`create`、`batch`、`query` 均不残留后台进程；每次调用后进程数归零，文件在退出时落盘。
 - `.docx`、`.xlsx`、`.pptx` 的 `create`/`close` 均成功；`--locale zh-CN` 创建成功；DOCX `query --json` 成功。
+- 构建期 XLSX 冒烟测试会创建工作簿，在一个 batch 中写入文本、公式、显式空值和 `bold`/`fill` 格式，随后验证 `get --json` 与零个 `validate --json` 错误。OfficeCLI v1.0.149 对显式空单元格的读回值为 `"(empty)"`。
 - 通过构建出的镜像端到端验证：签名 `fs_write`、`fs_list`、`doc_create`、`fs_link` 与签名下载均成功。
 - 未安装 OfficeCLI 导出插件时无法转换 PDF。
 
@@ -128,7 +129,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/chat2work-m
 
 ## CI 与发布
 
-`.github/workflows/ci.yml` 在每次 push 与 PR 时执行 `go vet`、`go test -race`、`go build` 与 Docker 镜像构建。`.github/workflows/release.yml` 在推送 `v*` tag 时构建并推送多架构（`linux/amd64`、`linux/arm64`）镜像到 GHCR。OfficeCLI 更新按设计保持手动（见上文版本策略）；后续可加一个定时工作流在出现新版本时自动开升级 PR。
+`.github/workflows/ci.yml` 在每次 push 与 PR 时执行 `go vet`、`go test -race`、`go build`，并通过 QEMU 构建 `linux/amd64,linux/arm64` Docker 镜像。两种架构的 Docker 构建都会执行固定版 OfficeCLI 的 XLSX 冒烟测试。`.github/workflows/release.yml` 在推送 `v*` tag 时构建并推送同一多架构镜像到 GHCR。OfficeCLI 更新按设计保持手动（见上文版本策略）；后续可加一个定时工作流在出现新版本时自动开升级 PR。
 
 ## 开发
 
